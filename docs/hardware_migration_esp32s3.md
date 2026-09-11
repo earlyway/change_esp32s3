@@ -83,20 +83,35 @@
 - [ ] 화면 육안 확인 (색상 바 4개, 노란 테두리가 화면 끝까지 닿는지, 카운터 증가)
 - [ ] 본 앱(`main.cpp.full`) 이식 시 `kTftWidth/kTftHeight` 240×320 반영, 애니메이션 좌표 재조정
 
-### 4단계. 스피커 출력 (ES8311)
-- [ ] ES8311 드라이버 (I2C 0x18) 초기화: 16kHz, 16bit, MCLK 사용
-- [ ] I2S0 을 `MASTER | TX | RX` 로 설치, MCLK=12, BCLK=13, LRCLK=14, DOUT=16, DIN=15
-- [ ] TCA9555 EXIO8 HIGH (앰프 켜기) → 사인파 테스트음 재생
-- [ ] 기존 `SPK_I2S_PORT = I2S_NUM_1` 구조를 I2S_NUM_0 공유로 변경
+### 4단계. 스피커 출력 (ES8311) — 완료 (2026-09-11)
+- [x] Waveshare 데모 zip의 `es8311`, `es7210` Arduino 라이브러리를 `lib/`에 복사 (es8311은 Wire 기반, 외부 의존 없음)
+- [x] ES8311 초기화: `es8311_create(I2C_NUM_0, 0x18)` → `es8311_init(16kHz, MCLK 4.096MHz(=fs×256), 16bit in/out, slave)` → 볼륨 70
+- [x] I2S0 `MASTER | TX | RX`, 16kHz / 16bit / 스테레오, `mclk_multiple=256`, MCLK 12 / BCLK 13 / LRCLK 14 / DOUT 16 / DIN 15
+- [x] 무음 100ms로 DMA 채운 후 TCA9555 EXIO8(PA_CTRL) HIGH → 팝 노이즈 방지
+- [x] 부팅 시 C5-E5-G5 차임, 이후 3초마다 440Hz 비프. K1 볼륨+10, K3 볼륨−10, K2 뮤트 토글. LCD에 상태 표시
+- [x] 시리얼: I2S/ES8311 초기화 에러 없음, 비프 루프 정상
+- [x] 실제 소리 확인: 차임/비프, K1/K3 음량 조절, K2 음소거 모두 정상
+- [ ] 본 앱 이식 시 `SPK_I2S_PORT = I2S_NUM_1` → I2S_NUM_0 공유 구조로 변경
 
-### 5단계. 마이크 입력 (ES7210)
-- [ ] ES7210 드라이버 (I2C 0x40) 초기화: 16kHz, 16bit
-- [ ] 기존 32bit 샘플 처리 → 16bit로 변경 (dBFS 계산, 업로드 포맷 확인)
-- [ ] 마이크 2개(스테레오) 입력 → 채널 하나 선택 또는 믹스
+### 5단계. 마이크 입력 (ES7210) — 완료 (2026-09-11)
+- [x] ES7210(I2C 0x40) 초기화: 16kHz, 16bit, 표준 I2S, TDM 활성화, MIC gain 30dB, ADC volume 0dB
+- [x] 4단계와 같은 I2S0 풀듀플렉스 구성 유지. DIN GPIO15에서 16bit 스테레오 512프레임씩 수신
+- [x] 좌/우 채널 RMS dBFS 및 peak 계산, LCD 실시간 레벨 바와 시리얼 로그 구현
+- [x] 실제 데이터 수신 확인: 정숙 시 약 L -49dBFS / R -46dBFS, 주변 소리에 약 -20~-30dBFS로 반응
+- [x] 테스트 중 스피커 앰프 EXIO8은 LOW로 유지하여 피드백 방지
+- [x] LCD L/R 레벨 바가 말소리에 정상 반응함을 수동 확인
+- [ ] MIC1/MIC2 가까이에서 각각 말하거나 가볍게 손가락으로 문질러 좌/우 채널 독립 반응 확인
+- [ ] 본 앱 이식 시 기존 32bit 샘플 처리 → 16bit 처리로 변경하고 업로드용 모노 채널 선택 또는 L/R 평균 믹스 결정
 
-### 6단계. 버튼 (Push-to-talk)
-- [ ] GPIO27 직결 → K1 버튼(TCA9555 EXIO9) I2C 폴링으로 변경
-- [ ] 또는 BOOT 버튼(GPIO0, 순수 GPIO)을 PTT로 사용 (더 간단)
+### 6단계. 버튼 (Push-to-talk) — 펌웨어 완료, 수동 확인 대기 (2026-09-11)
+- [x] PTT 버튼을 내장 K1(TCA9555 EXIO9, Active LOW)로 확정. BOOT(GPIO0)는 업로드/복구용으로 유지
+- [x] 30ms 디바운스 및 press/release 에지 감지
+- [x] K1 누름: IDLE → LISTENING, 세션 통계 초기화, 마이크 데이터 분석 시작
+- [x] K1 누르는 동안: L/R 레벨 바, dBFS/peak, 캡처 프레임 수 갱신
+- [x] K1 뗌: RELEASED, 캡처 시간/프레임/채널별 최대 dBFS 요약 표시
+- [x] 유휴 상태에서도 I2S RX DMA는 비우되, PTT를 누른 동안만 데이터를 캡처 대상으로 계산
+- [x] 빌드·업로드 및 ES7210/I2S 초기화 로그 정상
+- [ ] 실제 K1 길게 누름 → 말하기 → 떼기 동작과 LCD/시리얼 상태 전환 수동 확인
 
 ### 7단계. 통합 테스트
 - [ ] WiFi → STT 업로드 → TTS 재생 → 애니메이션 전체 흐름

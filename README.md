@@ -69,9 +69,9 @@ button below RESET) while plugging in USB, then release.
 | 1 | Boot, USB serial, flash/PSRAM verification | done |
 | 2 | I2C bus + TCA9555; all 5 I2C devices detected, FPC link verified | done |
 | 3 | LCD bring-up (ST7789, backlight, 240×320) | done |
-| 4 | Speaker output via ES8311 codec + PA enable | pending |
-| 5 | Microphone input via ES7210 ADC | pending |
-| 6 | Push-to-talk button (BOOT / K1) | pending |
+| 4 | Speaker output via ES8311 codec + PA enable | done |
+| 5 | Microphone input via ES7210 ADC (live stereo level meter) | done |
+| 6 | Push-to-talk using built-in K1 (TCA9555 EXIO9) | firmware ready; manual check pending |
 | 7 | Port full application, end-to-end STT → TTS test | pending |
 | 8 | Optional: touch, RGB LED ring, echo cancellation | later |
 

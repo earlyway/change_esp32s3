@@ -69,8 +69,9 @@
 #endif
 #define PIN_TFT_RST (-1)       // driven via TCA9555 EXIO0, not a GPIO
 
-#define TFT_WIDTH  240
+#define TFT_WIDTH  240         // panel native size (portrait)
 #define TFT_HEIGHT 320
+#define TFT_ROTATION 1         // landscape 320x240, confirmed on hardware 2026-09-11
 
 // ---------------------------------------------------------------- TCA9555 expander pins (EXIOx)
 #define EXIO_LCD_RST   0
