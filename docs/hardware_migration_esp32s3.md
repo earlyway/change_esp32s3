@@ -81,7 +81,7 @@
 - [x] GPIO5 백라이트 HIGH
 - [x] 테스트 화면: 빨/초/파 전체 플래시 → 상단 색상 바 4개 + 노란 테두리 + 텍스트 + 하단 frame 카운터(0.5초 갱신)
 - [ ] 화면 육안 확인 (색상 바 4개, 노란 테두리가 화면 끝까지 닿는지, 카운터 증가)
-- [ ] 본 앱(`main.cpp.full`) 이식 시 `kTftWidth/kTftHeight` 240×320 반영, 애니메이션 좌표 재조정
+- [x] 본 앱 이식 시 가로 320×240 반영, 180×180 애니메이션을 화면 중앙 `(70, 30)`에 배치
 
 ### 4단계. 스피커 출력 (ES8311) — 완료 (2026-09-11)
 - [x] Waveshare 데모 zip의 `es8311`, `es7210` Arduino 라이브러리를 `lib/`에 복사 (es8311은 Wire 기반, 외부 의존 없음)
@@ -91,7 +91,7 @@
 - [x] 부팅 시 C5-E5-G5 차임, 이후 3초마다 440Hz 비프. K1 볼륨+10, K3 볼륨−10, K2 뮤트 토글. LCD에 상태 표시
 - [x] 시리얼: I2S/ES8311 초기화 에러 없음, 비프 루프 정상
 - [x] 실제 소리 확인: 차임/비프, K1/K3 음량 조절, K2 음소거 모두 정상
-- [ ] 본 앱 이식 시 `SPK_I2S_PORT = I2S_NUM_1` → I2S_NUM_0 공유 구조로 변경
+- [x] 본 앱의 스피커 출력을 I2S_NUM_1 → 마이크와 공유하는 I2S_NUM_0 구조로 변경
 
 ### 5단계. 마이크 입력 (ES7210) — 완료 (2026-09-11)
 - [x] ES7210(I2C 0x40) 초기화: 16kHz, 16bit, 표준 I2S, TDM 활성화, MIC gain 30dB, ADC volume 0dB
@@ -101,9 +101,9 @@
 - [x] 테스트 중 스피커 앰프 EXIO8은 LOW로 유지하여 피드백 방지
 - [x] LCD L/R 레벨 바가 말소리에 정상 반응함을 수동 확인
 - [ ] MIC1/MIC2 가까이에서 각각 말하거나 가볍게 손가락으로 문질러 좌/우 채널 독립 반응 확인
-- [ ] 본 앱 이식 시 기존 32bit 샘플 처리 → 16bit 처리로 변경하고 업로드용 모노 채널 선택 또는 L/R 평균 믹스 결정
+- [x] 본 앱의 기존 32bit 처리 → 16bit 처리로 변경하고 업로드용 모노 PCM은 L/R 평균 믹스로 결정
 
-### 6단계. 버튼 (Push-to-talk) — 펌웨어 완료, 수동 확인 대기 (2026-09-11)
+### 6단계. 버튼 (Push-to-talk) — 완료 (2026-09-11)
 - [x] PTT 버튼을 내장 K1(TCA9555 EXIO9, Active LOW)로 확정. BOOT(GPIO0)는 업로드/복구용으로 유지
 - [x] 30ms 디바운스 및 press/release 에지 감지
 - [x] K1 누름: IDLE → LISTENING, 세션 통계 초기화, 마이크 데이터 분석 시작
@@ -111,10 +111,34 @@
 - [x] K1 뗌: RELEASED, 캡처 시간/프레임/채널별 최대 dBFS 요약 표시
 - [x] 유휴 상태에서도 I2S RX DMA는 비우되, PTT를 누른 동안만 데이터를 캡처 대상으로 계산
 - [x] 빌드·업로드 및 ES7210/I2S 초기화 로그 정상
-- [ ] 실제 K1 길게 누름 → 말하기 → 떼기 동작과 LCD/시리얼 상태 전환 수동 확인
+- [x] 실제 K1 길게 누름 → 말하기 → 떼기 확인: `listen` 전환, PCM 업로드, release/end 정상
 
-### 7단계. 통합 테스트
-- [ ] WiFi → STT 업로드 → TTS 재생 → 애니메이션 전체 흐름
+### 7단계. 전체 앱 이식 및 통합 테스트 — 완료 (2026-09-11)
+- [x] 기존 전체 앱(`src/main.cpp.full`)을 `src/main.cpp` 통합 기반으로 복원
+- [x] LCD: TCA9555 EXIO0 리셋, 커스텀 SPI 핀, 백라이트 GPIO5, 가로 320×240 적용
+- [x] 오디오: I2S0 하나를 16kHz/16bit 스테레오 TX+RX 풀듀플렉스로 설치
+- [x] ES7210: 듀얼 마이크 초기화 및 L/R 평균 모노 PCM으로 기존 STT 업로드 프로토콜 연결
+- [x] ES8311 + NS4150B: 코덱 초기화, 볼륨 70, EXIO8 앰프 Enable, 기존 TTS/테스트음 출력 연결
+- [x] PTT: 기존 GPIO27 입력을 내장 K1(EXIO9) I2C 폴링으로 교체. 말하는 동안만 1초 PCM 청크 업로드
+- [x] 기존 기능 유지: 더블 버퍼, tail zero-padding, `/utterance/end`, TTS pull/flush, barge-in, 상태/감정 애니메이션, 테스트 비프/REDRED
+- [x] 빌드 및 보드 업로드 성공 (RAM 34.0%, Flash 34.2%)
+- [x] 런타임: LCD, 공유 I2S0, ES7210, ES8311, 3개 FreeRTOS task 시작 및 마이크 레벨 로그 정상
+- [x] 공유 I2S 동시성: 마이크 RX가 동작하는 동안 `b` 440Hz 테스트음 출력 성공
+- [x] Wi-Fi 연결 확인. 실패 원인 `reason=201`(AP not found)을 진단하고 로컬 SSID 오타 및 Mac LAN IP 수정
+- [x] Mac 서버 준비: faster-whisper base, 한국어 고정, Ollama qwen2.5:14b, macOS Yuna TTS
+- [x] K1 PTT → 1초 PCM 청크 POST(HTTP 200) → `/utterance/end`(HTTP 200) 정상
+- [x] 실제 STT 인식 성공: 한국어 문장 partial/committed 생성
+- [x] Ollama 자동 답변 성공: positive/neutral 감정 태그 생성
+- [x] macOS TTS → ESP32 pull → ES8311 스피커 재생 성공
+- [x] LCD 상태 전환 확인 로그: `idle → listen → think → speak → idle`, 감정별 face 재생 경로 정상
+- [x] 세 차례 PTT 세션 중 두 차례 완전한 STT→LLM→TTS 응답 확인
+
+#### 7단계 안전 백업 (로컬 전용, Git 제외)
+- `src/main.cpp.stage6.stage-backup`: 6단계 PTT 테스트 펌웨어
+  - SHA-256: `b60c62d756a8d4fdcd246af6a86ddf9f0536740d6ea803a20eda4efbec4a9381`
+- `src/main.cpp.legacy.stage-backup`: 이식 전 기존 전체 앱
+  - SHA-256: `1b8c8c2a548a995f2a0a9e9b08d3dde6c6fd0beead66aba29cc749b17688b8df`
+- 두 파일은 `.gitignore`의 `*.stage-backup` 규칙으로 커밋에서 제외된다.
 
 ### (선택) 8단계. 새 기능 활용
 - 터치 (CST816D, I2C 0x15)
@@ -200,7 +224,7 @@
 | PIN_TFT_RST | 21 | -1 (TCA9555 EXIO0) |
 | (신규) PIN_TFT_SCK / MOSI / MISO | 18 / 23 / — | 4 / 9 / 8 |
 | (신규) PIN_TFT_BL | 3V3 직결 | 5 |
-| PIN_BUTTON_MIC | 27 | 0 (BOOT) 또는 TCA9555 EXIO9 |
+| PIN_BUTTON_MIC | 27 | TCA9555 EXIO9 (내장 K1, 확정) |
 
 ---
 
@@ -234,7 +258,49 @@
 - 핀 헤더: 비어 있음
 - PC 연결: USB-C ↔ MacBook. `/dev/cu.usbmodem*` 포트 정상 인식 확인됨
 
-## 6. 참고 사항
+## 6. 디스플레이 깜빡임 수정
+
+- 증상: 통합 앱의 상태 화면이 약 0.5초마다 검게 깜빡임.
+- 원인: `displayTask()`가 500ms마다 `drawStatusScreen()`을 호출하고,
+  `drawStatusScreen()`이 매번 `fillScreen(BLACK)`으로 전체 프레임을 지운 뒤
+  모든 텍스트를 다시 그렸음. SPI 전송 사이에 검은 화면이 눈에 보였다.
+- 수정: 전체 화면 지우기를 제거하고 `drawStatusRow()`가 변경되는 텍스트 행의
+  21픽셀 높이 영역만 검게 지운 뒤 다시 그리도록 변경.
+- 애니메이션, THINKING 및 감정 화면 전환 시 필요한 전체 지우기는 그대로 유지.
+- 수정 펌웨어 빌드·업로드 완료.
+
+## 7. macOS 원클릭 실행
+
+프로젝트 루트의 **`Start Robot.command`**를 Finder에서 더블클릭한다.
+
+자동 처리 항목:
+1. `/dev/cu.usbmodem*`에서 ESP32-S3 USB 연결 확인
+2. Mac의 현재 LAN IP 확인 및 Git 제외된 `server_config.h` 자동 갱신
+3. 최신 PlatformIO 펌웨어 빌드·업로드
+4. Python STT 의존성 확인 (없으면 `.venv` 생성 및 자동 설치)
+5. Ollama 실행 상태 확인 및 가능한 경우 자동 시작
+6. 한국어 faster-whisper + Ollama + macOS TTS 서버 실행
+7. `http://localhost:3000` 자동 열기
+
+서버 도구는 현재 프로젝트의 `tools/`에 포함했다. 로컬 로그·PID는
+`.robot-runtime/`, Python 가상환경은 `.venv/`에 생성되며 모두 Git에서 제외된다.
+
+실행 프로그램 검증 결과: USB 감지 → IP 갱신 → 빌드/업로드 → Ollama 확인 →
+Whisper 모델 로드 → 서버 준비 → localhost 열기까지 정상 완료.
+
+### 원클릭 종료
+
+프로젝트 루트의 **`Stop Robot.command`**를 Finder에서 더블클릭한다.
+
+- PID 파일과 포트 3000을 확인하되, 실행 명령과 작업 경로를 대조하여
+  **현재 프로젝트의 `tools/stt_server.py` 프로세스만** 종료한다.
+- PID 파일이 오래됐거나 서버를 수동 실행한 경우에도 포트 기반 fallback으로 찾는다.
+- 정상 종료를 먼저 요청하고, 5초 안에 종료되지 않을 때만 강제 종료한다.
+- ESP32 펌웨어는 그대로 두며 USB-C를 분리할 필요가 없다.
+- Ollama는 다른 프로그램도 사용할 수 있으므로 종료하지 않는다.
+- 실제 테스트에서 서버 종료 및 포트 3000 해제를 확인한 뒤 서버를 정상 재시작했다.
+
+## 8. 참고 사항
 
 - Waveshare 위키 Arduino 예제 zip에 `es8311`, `es7210`, `TCA9555` 라이브러리가 포함되어 있다. `lib/` 폴더에 넣는 것이 코덱 초기화의 가장 빠른 길.
   - 데모 다운로드: https://files.waveshare.com/wiki/ESP32-S3-AUDIO-Board/ESP32-S3-AUDIO-Board-Demo.zip

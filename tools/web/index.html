@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ESP32 실시간 STT</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --panel: #1a1d24;
+      --border: #2a2f3a;
+      --text: #e6e8ec;
+      --muted: #8b93a1;
+      --accent: #4f9dff;
+      --ok: #35c46b;
+      --bad: #ff5d5d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Apple SD Gothic Neo", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      padding: 32px 16px;
+    }
+    .wrap { width: 100%; max-width: 760px; }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 20px;
+    }
+    h1 { font-size: 20px; margin: 0; font-weight: 600; }
+    .status { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--bad); transition: background .2s; }
+    .dot.connected { background: var(--ok); }
+    .field {
+      position: relative;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+    }
+    .editor {
+      width: 100%;
+      min-height: 220px;
+      max-height: 420px;
+      overflow-y: auto;
+      font-size: 18px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-word;
+      outline: none;
+      cursor: text;
+    }
+    .editor.is-empty:not(:focus-within)::before {
+      content: "마이크로 말하면 여기에 텍스트가 실시간으로 입력됩니다. 직접 타이핑·수정도 가능합니다…";
+      color: var(--muted);
+      display: block;
+      pointer-events: none;
+    }
+    .committed {
+      outline: none;
+      min-width: 1ch;
+    }
+    .committed:focus {
+      border-radius: 2px;
+      box-shadow: 0 0 0 1px var(--border);
+    }
+    .partial-inline {
+      color: var(--muted);
+      font-style: italic;
+      user-select: none;
+    }
+    .toolbar { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+    button {
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 9px 16px;
+      font-size: 14px;
+      cursor: pointer;
+      transition: border-color .15s, background .15s;
+    }
+    button:hover { border-color: var(--accent); }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .speak-box {
+      margin-top: 16px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 16px;
+    }
+    .speak-box label {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+    .speak-row { display: flex; gap: 8px; flex-wrap: wrap; }
+    .speak-row input {
+      flex: 1;
+      min-width: 180px;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 9px 12px;
+      font-size: 15px;
+    }
+    .speak-status { margin-top: 8px; font-size: 12px; color: var(--muted); min-height: 1.4em; }
+    .robot-reply {
+      margin-top: 10px;
+      font-size: 16px;
+      line-height: 1.5;
+      min-height: 1.5em;
+    }
+    .robot-meta { margin-top: 6px; font-size: 12px; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>ESP32 실시간 STT</h1>
+      <div class="status">
+        <span class="dot" id="dot"></span>
+        <span id="statusText">연결 중…</span>
+      </div>
+    </header>
+
+    <div class="field">
+      <div class="editor is-empty" id="editor" aria-label="STT 실시간 입력">
+        <span id="committedText" class="committed" contenteditable="true" spellcheck="true"></span><span id="partialText" class="partial-inline" contenteditable="false"></span>
+      </div>
+    </div>
+
+    <div class="toolbar">
+      <button class="primary" id="copyBtn">복사</button>
+      <button id="clearBtn">입력창 비우기</button>
+      <button id="resetBtn">전사 초기화 (서버)</button>
+    </div>
+
+    <div class="speak-box">
+      <label for="speakText">ESP32 스피커로 말하기 (Phase 2 TTS)</label>
+      <div class="speak-row">
+        <input id="speakText" type="text" maxlength="500" placeholder="문장을 입력하거나, 위 STT 텍스트를 말한 뒤 버튼을 누르세요" />
+        <button class="primary" id="speakBtn">말하기</button>
+      </div>
+      <div class="speak-status" id="speakStatus"></div>
+    </div>
+
+    <div class="speak-box">
+      <label for="askText">로봇 답변 (Phase 3 LLM → TTS)</label>
+      <div class="speak-row">
+        <input id="askText" type="text" maxlength="500" placeholder="질문하거나, 위 STT 확정문을 비워 두고 버튼을 누르세요" />
+        <button class="primary" id="askBtn">물어보기</button>
+      </div>
+      <div class="robot-reply" id="robotReply"></div>
+      <div class="robot-meta" id="robotMeta">백엔드 확인 중…</div>
+      <div class="speak-status" id="askStatus"></div>
+    </div>
+
+    <p class="hint">
+      확정 텍스트(흰색)는 클릭 후 키보드로 직접 수정할 수 있습니다. 편집 중에는 서버 확정문만 덮어쓰지 않고, 회색 partial은 계속 갱신됩니다.
+      <br />ESP32가 <code>/upload</code> 로 1초 단위 PCM 청크를 내면 자동으로 인식됩니다.
+      <br /><strong>말하기</strong>는 맥의 <code>say</code>로 음성을 만든 뒤 ESP32가 <code>/speaker/pull</code>로 받아 재생합니다.
+      <br /><strong>물어보기</strong>는 기본 Ollama qwen2.5:14b, 전환은 <code>LLM_BACKEND=openai</code> + <code>OPENAI_API_KEY</code>. 발화 종료 시 자동 답변(<code>ROBOT_AUTO_REPLY=1</code>).
+    </p>
+  </div>
+
+  <script>
+    const editor = document.getElementById("editor");
+    const committedEl = document.getElementById("committedText");
+    const partialEl = document.getElementById("partialText");
+    const dot = document.getElementById("dot");
+    const statusText = document.getElementById("statusText");
+
+    let ws = null;
+    let reconnectDelay = 500;
+    let lastCommitted = "";
+    let lastPartial = "";
+    let userEditing = false;
+
+    function setConnected(connected) {
+      dot.classList.toggle("connected", connected);
+      statusText.textContent = connected ? "연결됨" : "연결 끊김 — 재연결 중…";
+    }
+
+    function committedFromDom() {
+      return committedEl.innerText.replace(/\u00a0/g, " ");
+    }
+
+    function fullText() {
+      return committedFromDom() + lastPartial;
+    }
+
+    function updatePlaceholder() {
+      const empty = !committedFromDom().trim() && !lastPartial;
+      editor.classList.toggle("is-empty", empty);
+    }
+
+    function ensurePartialNode() {
+      if (partialEl.parentNode !== editor) {
+        editor.appendChild(partialEl);
+      }
+    }
+
+    function applyState(state) {
+      const serverCommitted = state.committed || "";
+      lastPartial = state.partial || "";
+      partialEl.textContent = lastPartial;
+      ensurePartialNode();
+
+      if (!userEditing) {
+        lastCommitted = serverCommitted;
+        committedEl.textContent = lastCommitted;
+      }
+
+      if (state.robot_reply) {
+        showRobot(state);
+      }
+
+      updatePlaceholder();
+      editor.scrollTop = editor.scrollHeight;
+    }
+
+    function showRobot(state) {
+      const replyEl = document.getElementById("robotReply");
+      const metaEl = document.getElementById("robotMeta");
+      replyEl.textContent = state.robot_reply || "";
+      const bits = [];
+      if (state.robot_emotion) bits.push("emotion=" + state.robot_emotion);
+      if (state.llm_backend) bits.push(state.llm_backend);
+      if (state.llm_model) bits.push(state.llm_model);
+      if (state.llm_seconds != null) bits.push(state.llm_seconds + "s");
+      if (bits.length) metaEl.textContent = bits.join(" · ");
+    }
+
+    committedEl.addEventListener("focus", () => {
+      userEditing = true;
+      updatePlaceholder();
+    });
+
+    committedEl.addEventListener("blur", () => {
+      userEditing = false;
+      lastCommitted = committedFromDom();
+      updatePlaceholder();
+    });
+
+    committedEl.addEventListener("input", () => {
+      lastCommitted = committedFromDom();
+      ensurePartialNode();
+      updatePlaceholder();
+    });
+
+    editor.addEventListener("click", (e) => {
+      if (e.target === partialEl) {
+        committedEl.focus();
+        const range = document.createRange();
+        const sel = window.getSelection();
+        range.selectNodeContents(committedEl);
+        range.collapse(false);
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+    });
+
+    function connect() {
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+      ws.onopen = () => {
+        setConnected(true);
+        reconnectDelay = 500;
+      };
+      ws.onmessage = (ev) => {
+        try {
+          applyState(JSON.parse(ev.data));
+        } catch (_) { /* ignore malformed frames */ }
+      };
+      ws.onclose = () => {
+        setConnected(false);
+        setTimeout(connect, reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 2, 5000);
+      };
+      ws.onerror = () => ws.close();
+    }
+
+    document.getElementById("copyBtn").addEventListener("click", async () => {
+      const text = fullText();
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch (_) {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+      }
+    });
+
+    function forceClear() {
+      userEditing = false;
+      applyState({ committed: "", partial: "" });
+    }
+
+    document.getElementById("clearBtn").addEventListener("click", () => {
+      forceClear();
+      committedEl.focus();
+    });
+
+    document.getElementById("resetBtn").addEventListener("click", () => {
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send("reset");
+      forceClear();
+      committedEl.focus();
+    });
+
+    const speakInput = document.getElementById("speakText");
+    const speakStatus = document.getElementById("speakStatus");
+    const speakBtn = document.getElementById("speakBtn");
+
+    async function speakText() {
+      const typed = speakInput.value.trim();
+      const fromStt = fullText().trim();
+      const text = typed || fromStt;
+      if (!text) {
+        speakStatus.textContent = "말할 문장을 입력하거나, 먼저 마이크로 말해 주세요.";
+        return;
+      }
+      speakBtn.disabled = true;
+      speakStatus.textContent = "TTS 변환 중…";
+      try {
+        const resp = await fetch("/speaker/say", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, emotion: "none" }),
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) {
+          speakStatus.textContent = "실패: " + (data.error || resp.status);
+        } else {
+          speakStatus.textContent = `큐에 넣음 (${data.seconds}s, ${data.chunks}청크). ESP32 시리얼에 pull 로그가 뜨면 수신된 것입니다.`;
+        }
+      } catch (err) {
+        speakStatus.textContent = "요청 실패: " + err;
+      } finally {
+        speakBtn.disabled = false;
+      }
+    }
+
+    speakBtn.addEventListener("click", speakText);
+    speakInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") speakText();
+    });
+
+    const askInput = document.getElementById("askText");
+    const askStatus = document.getElementById("askStatus");
+    const askBtn = document.getElementById("askBtn");
+
+    async function askRobot() {
+      const typed = askInput.value.trim();
+      const fromStt = fullText().trim();
+      const text = typed || fromStt;
+      if (!text) {
+        askStatus.textContent = "질문할 문장을 입력하거나, 먼저 마이크로 말해 주세요.";
+        return;
+      }
+      askBtn.disabled = true;
+      askStatus.textContent = "LLM 답변 생성 중…";
+      try {
+        const resp = await fetch("/robot/reply", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, speak: true }),
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) {
+          askStatus.textContent = "실패: " + (data.error || resp.status);
+        } else {
+          showRobot({
+            robot_reply: data.reply,
+            robot_emotion: data.emotion,
+            llm_backend: data.backend,
+            llm_model: data.model,
+            llm_seconds: data.elapsed_s,
+          });
+          const spoken = data.spoken ? `, TTS ${data.spoken.seconds}s` : "";
+          askStatus.textContent = `답변 완료 (${data.elapsed_s}s${spoken}).`;
+        }
+      } catch (err) {
+        askStatus.textContent = "요청 실패: " + err;
+      } finally {
+        askBtn.disabled = false;
+      }
+    }
+
+    askBtn.addEventListener("click", askRobot);
+    askInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") askRobot();
+    });
+
+    fetch("/robot/status")
+      .then((r) => r.json())
+      .then((data) => {
+        const meta = document.getElementById("robotMeta");
+        const auto = data.auto_reply ? "자동 답변 켜짐" : "자동 답변 꺼짐";
+        meta.textContent = (data.backend || "?") + " · " + (data.model || "?") + " · " + auto;
+        if (data.last) showRobot(data.last);
+      })
+      .catch(() => {
+        document.getElementById("robotMeta").textContent = "백엔드를 읽지 못했습니다. 서버를 재시작했는지 확인하세요.";
+      });
+
+    connect();
+  </script>
+</body>
+</html>

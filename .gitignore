@@ -9,3 +9,14 @@ include/wifi_credentials.h
 include/server_config.h
 
 .DS_Store
+
+# Local migration safety backups
+*.stage-backup
+
+# Local server settings and runtime files
+tools/llm.env
+tools/uploads/
+tools/__pycache__/
+tools/*.pyc
+.robot-runtime/
+.venv/

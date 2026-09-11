@@ -1,12 +1,12 @@
 # change_esp32s3
 
-Voice assistant firmware (push-to-talk mic → STT server → TTS playback, with an
-animated LCD face) being migrated from a classic ESP32 DevKit to the
+Voice assistant firmware (push-to-talk mic → STT → LLM → TTS playback, with an
+animated LCD face) migrated from a classic ESP32 DevKit to the
 **Waveshare ESP32-S3-AUDIO-Board**.
 
 This repository continues the work from `speaker_connect_tts`, but on completely
-new hardware. Only the application source was carried over; every hardware
-interface (mic, speaker, display, buttons) is being rewritten for the new board.
+new hardware. The microphone, speaker, display and button interfaces have been
+rewritten and verified on the new board.
 
 ## Hardware
 
@@ -26,7 +26,7 @@ The speaker is factory-mounted inside the board housing; nothing external is wir
 | I2S (shared TX+RX) | MCLK 12, BCLK 13, LRCLK 14, DIN 15 (mic), DOUT 16 (speaker) |
 | LCD SPI | CS 3, SCK 4, MOSI 9, MISO 8, DC 7, BL 5, RST → TCA9555 EXIO0 |
 | TCA9555 | EXIO0 LCD_RST, EXIO1 TP_RST, EXIO2 TP_INT, EXIO8 PA_CTRL (amp enable), EXIO9–11 K1–K3 |
-| Buttons | BOOT = GPIO0 (used as push-to-talk) |
+| Buttons | K1 = TCA9555 EXIO9 (push-to-talk); BOOT = GPIO0 (firmware recovery) |
 
 Full details, board layout photo and the step-by-step bring-up checklist are in
 [`docs/hardware_migration_esp32s3.md`](docs/hardware_migration_esp32s3.md) (Korean).
@@ -38,10 +38,39 @@ platformio.ini             board config: esp32-s3-devkitc-1 + 16MB/qio_opi overr
 include/hardware_pins.h    pin map for the new board
 include/tca9555.h          minimal TCA9555 IO-expander driver
 include/*.example.h        templates for WiFi / server secrets
-src/main.cpp               current bring-up test sketch (see status below)
-src/main.cpp.full          full application from speaker_connect_tts, to be ported
+src/main.cpp               integrated Waveshare application (stage 7)
+src/main.cpp.full          untouched legacy application reference
+tools/                     FastAPI STT, Ollama LLM, macOS TTS and web UI
+Start Robot.command        macOS double-click launcher
+Stop Robot.command         stops this project's local voice server
 docs/                      migration guide and images
 ```
+
+## One-click start on macOS
+
+1. Connect the ESP32-S3 to the Mac with its USB-C data cable.
+2. Double-click **`Start Robot.command`** in Finder.
+3. Wait for `READY`, then use the browser page opened at
+   `http://localhost:3000`.
+4. Hold the board's **K1** button while speaking and release it when finished.
+
+The launcher automatically:
+
+- detects the USB board and current Mac LAN IP;
+- updates the local firmware server address;
+- builds and uploads the latest PlatformIO firmware;
+- checks or installs Python STT dependencies;
+- starts Ollama when available;
+- starts the Korean STT/LLM/TTS server; and
+- opens the local web interface.
+
+On first use, macOS may require right-clicking the command and choosing **Open**.
+The first Whisper model/dependency setup can also take several minutes. Runtime
+logs are written under the git-ignored `.robot-runtime/` directory.
+
+To stop the local pipeline, double-click **`Stop Robot.command`**. It only stops
+this project's port-3000 STT/LLM/TTS server. The ESP32 may remain connected, and
+Ollama is intentionally left running because other applications may use it.
 
 ## Build & flash
 
@@ -71,8 +100,8 @@ button below RESET) while plugging in USB, then release.
 | 3 | LCD bring-up (ST7789, backlight, 240×320) | done |
 | 4 | Speaker output via ES8311 codec + PA enable | done |
 | 5 | Microphone input via ES7210 ADC (live stereo level meter) | done |
-| 6 | Push-to-talk using built-in K1 (TCA9555 EXIO9) | firmware ready; manual check pending |
-| 7 | Port full application, end-to-end STT → TTS test | pending |
+| 6 | Push-to-talk using built-in K1 (TCA9555 EXIO9) | done |
+| 7 | Full app: K1 → STT → Ollama → TTS → emotion face | done |
 | 8 | Optional: touch, RGB LED ring, echo cancellation | later |
 
 ## Toolchain notes

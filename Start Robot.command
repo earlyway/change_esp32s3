@@ -1,0 +1,181 @@
+#!/bin/bash
+
+# One-click launcher for the Waveshare ESP32-S3 voice assistant.
+# Double-click this file in Finder after connecting the board over USB-C.
+
+set -u
+
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+RUNTIME_DIR="$PROJECT_DIR/.robot-runtime"
+SERVER_LOG="$RUNTIME_DIR/server.log"
+SERVER_PID="$RUNTIME_DIR/server.pid"
+WEB_URL="http://localhost:3000"
+
+mkdir -p "$RUNTIME_DIR"
+cd "$PROJECT_DIR"
+
+exec > >(tee -a "$RUNTIME_DIR/launcher.log") 2>&1
+
+fail() {
+  printf '\n[ERROR] %s\n' "$1"
+  printf 'Press Return to close this window...'
+  read -r _
+  exit 1
+}
+
+find_pio() {
+  if command -v pio >/dev/null 2>&1; then
+    command -v pio
+  elif [[ -x "$HOME/.platformio/penv/bin/pio" ]]; then
+    printf '%s\n' "$HOME/.platformio/penv/bin/pio"
+  else
+    return 1
+  fi
+}
+
+current_lan_ip() {
+  local ip
+  ip="$(ipconfig getifaddr en0 2>/dev/null || true)"
+  if [[ -z "$ip" ]]; then
+    ip="$(ifconfig en0 2>/dev/null | awk '/inet / {print $2; exit}')"
+  fi
+  printf '%s\n' "$ip"
+}
+
+update_server_ip() {
+  local ip="$1"
+  ROBOT_SERVER_IP="$ip" python3 - "$PROJECT_DIR/include/server_config.h" <<'PY'
+import os
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+updated, count = re.subn(
+    r'(#define\s+POST_SERVER_HOST\s+)"[^"]*"',
+    rf'\1"{os.environ["ROBOT_SERVER_IP"]}"',
+    text,
+    count=1,
+)
+if count != 1:
+    raise SystemExit("POST_SERVER_HOST was not found in include/server_config.h")
+path.write_text(updated)
+PY
+}
+
+ensure_python_deps() {
+  if python3 -c "import fastapi, uvicorn, faster_whisper, numpy" >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+    return
+  fi
+
+  echo "[Setup] Python STT dependencies are missing; creating .venv..."
+  if [[ ! -x "$PROJECT_DIR/.venv/bin/python" ]]; then
+    python3 -m venv "$PROJECT_DIR/.venv" || fail "Could not create Python virtual environment."
+  fi
+  "$PROJECT_DIR/.venv/bin/python" -m pip install --upgrade pip
+  "$PROJECT_DIR/.venv/bin/python" -m pip install -r "$PROJECT_DIR/tools/requirements.txt" \
+    || fail "Could not install STT dependencies."
+  PYTHON_BIN="$PROJECT_DIR/.venv/bin/python"
+}
+
+ensure_ollama() {
+  if curl -fsS --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+    echo "[Ollama] Service ready."
+    return
+  fi
+
+  if command -v ollama >/dev/null 2>&1; then
+    echo "[Ollama] Starting local service..."
+    nohup ollama serve >"$RUNTIME_DIR/ollama.log" 2>&1 &
+  elif [[ -d "/Applications/Ollama.app" ]]; then
+    echo "[Ollama] Opening Ollama.app..."
+    open -a Ollama
+  else
+    echo "[WARN] Ollama is not installed. STT and manual TTS will work, but automatic LLM replies will not."
+    return
+  fi
+
+  for _ in {1..30}; do
+    curl -fsS --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && {
+      echo "[Ollama] Service ready."
+      return
+    }
+    sleep 1
+  done
+  echo "[WARN] Ollama did not become ready. The launcher will continue with STT/TTS only."
+}
+
+start_stt_server() {
+  if curl -fsS --max-time 2 "$WEB_URL/robot/status" >/dev/null 2>&1; then
+    echo "[Server] Already running on port 3000."
+    return
+  fi
+
+  if lsof -tiTCP:3000 -sTCP:LISTEN >/dev/null 2>&1; then
+    fail "Port 3000 is occupied by another program."
+  fi
+
+  echo "[Server] Starting Korean STT / LLM / TTS pipeline..."
+  : >"$SERVER_LOG"
+  nohup env STT_LANGUAGE=ko "$PYTHON_BIN" -u "$PROJECT_DIR/tools/stt_server.py" \
+    >"$SERVER_LOG" 2>&1 &
+  echo "$!" >"$SERVER_PID"
+
+  # First model load can take longer, so allow up to two minutes.
+  for _ in {1..120}; do
+    if curl -fsS --max-time 2 "$WEB_URL/robot/status" >/dev/null 2>&1; then
+      echo "[Server] Ready."
+      return
+    fi
+    if [[ -f "$SERVER_PID" ]] && ! kill -0 "$(cat "$SERVER_PID")" 2>/dev/null; then
+      tail -30 "$SERVER_LOG"
+      fail "The STT server stopped during startup."
+    fi
+    sleep 1
+  done
+  tail -30 "$SERVER_LOG"
+  fail "Timed out waiting for the STT server."
+}
+
+echo "=================================================="
+echo " Waveshare ESP32-S3 Voice Assistant"
+echo "=================================================="
+
+[[ -f "$PROJECT_DIR/include/wifi_credentials.h" ]] \
+  || fail "Missing include/wifi_credentials.h. Copy the example and enter the 2.4GHz Wi-Fi details."
+if [[ ! -f "$PROJECT_DIR/include/server_config.h" ]]; then
+  cp "$PROJECT_DIR/include/server_config.example.h" "$PROJECT_DIR/include/server_config.h" \
+    || fail "Could not create include/server_config.h."
+fi
+
+BOARD_PORT="$(ls /dev/cu.usbmodem* 2>/dev/null | head -n 1 || true)"
+[[ -n "$BOARD_PORT" ]] || fail "ESP32-S3 was not found. Connect its USB-C data cable and try again."
+echo "[Board] Found: $BOARD_PORT"
+
+MAC_IP="$(current_lan_ip)"
+[[ -n "$MAC_IP" ]] || fail "Could not determine the Mac LAN IP. Connect the Mac to Wi-Fi and try again."
+echo "[Network] Mac LAN IP: $MAC_IP"
+update_server_ip "$MAC_IP" || fail "Could not update the firmware server address."
+
+PIO_BIN="$(find_pio)" || fail "PlatformIO CLI was not found. Install the PlatformIO VS Code extension first."
+echo "[Board] Building and uploading the latest firmware..."
+"$PIO_BIN" run -e esp32s3_audio -t upload --upload-port "$BOARD_PORT" \
+  || fail "Firmware upload failed. Close any serial monitor and try again."
+echo "[Board] Firmware ready."
+
+ensure_python_deps
+ensure_ollama
+start_stt_server
+
+echo "[Web] Opening $WEB_URL"
+open "$WEB_URL"
+
+echo
+echo "READY: Hold K1, speak, then release it."
+echo "The server continues running after this window closes."
+echo "Server log: $SERVER_LOG"
+echo
+printf 'Press Return to close this launcher window...'
+read -r _

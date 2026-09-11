@@ -1,0 +1,14 @@
+# Real-time STT server dependencies
+#
+# Install:
+#   pip install -r tools/requirements.txt
+#
+# faster-whisper pulls in CTranslate2; on Apple Silicon it runs on CPU.
+faster-whisper>=1.0.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+numpy>=1.24.0
+
+# Optional: voice-activity detection to trim silence / segment utterances.
+# Safe to skip if you do not enable VAD in stt_processor.py.
+webrtcvad>=2.0.10
