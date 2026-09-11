@@ -73,7 +73,9 @@
 - [x] EXIO9~11 (K1~K3), EXIO2 (TP_INT) 입력 설정, 유휴 상태 0xFEDF (K1/K2/K3 = 1 = 안 눌림)
 - [ ] K1/K2/K3 버튼 실제 눌림 확인 (시리얼 모니터에서 `[EXIO] ... K1=0` 확인) — 수동 테스트
 
-### 3단계. LCD 표시 — 펌웨어 완료, 화면 육안 확인 대기 (2026-09-11)
+### 3단계. LCD 표시 — 완료 (2026-09-11)
+- [x] 세로(rotation 0) 색상 바 + 카운터 육안 확인 OK
+- [x] **가로 모드로 변경**: `setRotation(1)` → 320×240. 화면에 TOP/BOTTOM/L/R 방향 라벨 표시. 상하가 뒤집혀 보이면 `kRotation = 3`으로 변경
 - [x] TCA9555로 EXIO0(LCD_RST) / EXIO1(TP_RST) LOW→HIGH 리셋 펄스
 - [x] `SPI.begin(SCK=4, MISO=8, MOSI=9, CS=3)` 후 `Adafruit_ST7789 tft(&SPI, CS=3, DC=7, RST=-1)`, `init(240, 320)`, SPI 40MHz
 - [x] GPIO5 백라이트 HIGH

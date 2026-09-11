@@ -1,5 +1,6 @@
 // Stage 3 bring-up test: 2inch Capacitive Touch LCD (ST7789T3, 240x320) over SPI.
 // LCD_RST lives behind the TCA9555 (EXIO0); backlight is GPIO5.
+// Landscape orientation (320x240): rotation 1. Use 3 if the image is upside down.
 // Expected: backlight on, 4 color bars, white text, a moving counter.
 
 #include <Arduino.h>
@@ -10,6 +11,8 @@
 
 #include "hardware_pins.h"
 #include "tca9555.h"
+
+static constexpr uint8_t kRotation = 1;  // 1 or 3 = landscape (320x240)
 
 static TCA9555 exio(I2C_ADDR_TCA9555);
 // RST = -1: reset is driven through the IO expander, not a GPIO.
@@ -47,20 +50,31 @@ static void drawTestScreen() {
 
   tft.setTextWrap(false);
   tft.setTextColor(ST77XX_WHITE);
-  tft.setTextSize(2);
-  tft.setCursor(8, barH + 12);
+  tft.setTextSize(3);
+  tft.setCursor(8, barH + 14);
   tft.println("ESP32-S3-AUDIO");
-  tft.setCursor(8, barH + 36);
-  tft.println("Stage 3: LCD OK");
+  tft.setTextSize(2);
+  tft.setCursor(8, barH + 46);
+  tft.println("Stage 3: LCD landscape OK");
 
   tft.setTextSize(1);
   tft.setTextColor(ST77XX_CYAN);
-  tft.setCursor(8, barH + 70);
-  tft.printf("ST7789T3 %dx%d  rot=%d\n", tft.width(), tft.height(), tft.getRotation());
-  tft.setCursor(8, barH + 82);
-  tft.printf("SPI SCK=%d MOSI=%d CS=%d DC=%d\n", PIN_TFT_SCK, PIN_TFT_MOSI, PIN_TFT_CS, PIN_TFT_DC);
-  tft.setCursor(8, barH + 94);
-  tft.printf("RST=EXIO%d  BL=GPIO%d\n", EXIO_LCD_RST, PIN_TFT_BL);
+  tft.setCursor(8, barH + 76);
+  tft.printf("ST7789T3 %dx%d  rotation=%d\n", tft.width(), tft.height(), tft.getRotation());
+  tft.setCursor(8, barH + 88);
+  tft.printf("SPI SCK=%d MOSI=%d CS=%d DC=%d  RST=EXIO%d  BL=GPIO%d\n",
+             PIN_TFT_SCK, PIN_TFT_MOSI, PIN_TFT_CS, PIN_TFT_DC, EXIO_LCD_RST, PIN_TFT_BL);
+
+  // Orientation guide: arrow pointing to the top edge + labels on each edge.
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.setCursor(w / 2 - 9, barH + 4);
+  tft.print("TOP");
+  tft.setCursor(w / 2 - 20, tft.height() - 12);
+  tft.print("BOTTOM");
+  tft.setCursor(3, tft.height() / 2 - 4);
+  tft.print("L");
+  tft.setCursor(w - 9, tft.height() / 2 - 4);
+  tft.print("R");
 
   // Corner markers.
   tft.fillCircle(6, tft.height() - 7, 4, ST77XX_MAGENTA);
@@ -91,8 +105,9 @@ void setup() {
   SPI.begin(PIN_TFT_SCK, PIN_TFT_MISO, PIN_TFT_MOSI, PIN_TFT_CS);
   tft.init(TFT_WIDTH, TFT_HEIGHT);
   tft.setSPISpeed(40000000);
-  tft.setRotation(0);
-  Serial.printf("tft.init(%d, %d) done, SPI 40MHz\n", TFT_WIDTH, TFT_HEIGHT);
+  tft.setRotation(kRotation);
+  Serial.printf("tft.init(%d, %d) done, SPI 40MHz, rotation=%d -> %dx%d\n",
+                TFT_WIDTH, TFT_HEIGHT, kRotation, tft.width(), tft.height());
 
   // Quick full-screen flashes so a wrong-but-alive panel is still visible.
   tft.fillScreen(ST77XX_RED);   delay(250);
@@ -110,9 +125,9 @@ void loop() {
   if (now - lastMs < 500) { delay(5); return; }
   lastMs = now;
 
-  // Counter box near the bottom.
+  // Counter box near the bottom (left of the BOTTOM label).
   const int16_t y = tft.height() - 40;
-  tft.fillRect(8, y, tft.width() - 16, 20, ST77XX_BLACK);
+  tft.fillRect(8, y, 160, 20, ST77XX_BLACK);
   tft.setCursor(8, y + 2);
   tft.setTextSize(2);
   tft.setTextColor(ST77XX_GREEN);
