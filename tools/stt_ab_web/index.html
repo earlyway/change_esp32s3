@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>로봇 STT A/B 테스트</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", sans-serif;
+      --panel: color-mix(in srgb, CanvasText 7%, Canvas);
+      --line: color-mix(in srgb, CanvasText 20%, transparent);
+      --accent: #5271ff;
+    }
+    body { max-width: 1040px; margin: 0 auto; padding: 28px 18px 64px; }
+    h1 { margin: 0 0 8px; }
+    h2 { font-size: 18px; }
+    p { line-height: 1.55; }
+    .muted { color: color-mix(in srgb, CanvasText 62%, transparent); }
+    .panel, .result {
+      border: 1px solid var(--line); border-radius: 16px; padding: 18px;
+      background: var(--panel); margin-top: 16px;
+    }
+    .status { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .dot { width: 11px; height: 11px; border-radius: 50%; background: #999; }
+    .dot.ready { background: #2fb66d; }
+    .dot.loading { background: #f1a62b; animation: pulse 1s infinite alternate; }
+    .dot.error { background: #e05252; }
+    @keyframes pulse { to { opacity: .35; } }
+    button, input[type="file"], input[type="text"] {
+      font: inherit; border: 1px solid var(--line); border-radius: 10px;
+      padding: 10px 12px; background: Canvas;
+    }
+    button { cursor: pointer; background: var(--accent); color: white; border: 0; }
+    button:disabled { opacity: .5; cursor: wait; }
+    .upload { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .models { display: grid; grid-template-columns: repeat(auto-fit,minmax(290px,1fr)); gap: 12px; }
+    .model { border: 1px solid var(--line); border-radius: 12px; padding: 14px; background: Canvas; }
+    .model h3 { margin: 0 0 8px; font-size: 16px; }
+    .transcript { min-height: 3.5em; white-space: pre-wrap; line-height: 1.55; }
+    .meta { font-size: 13px; color: color-mix(in srgb, CanvasText 62%, transparent); }
+    .reference { display: grid; gap: 8px; margin: 14px 0; }
+    .reference input { width: 100%; box-sizing: border-box; }
+    audio { width: 100%; margin-top: 8px; }
+    code { background: color-mix(in srgb, CanvasText 10%, transparent); padding: 2px 5px; border-radius: 5px; }
+  </style>
+</head>
+<body>
+  <h1>로봇 STT A/B 테스트</h1>
+  <p class="muted">동일한 16 kHz mono 녹음을 Qwen3-ASR 0.6B와 Moonshine Korean Tiny로 처리합니다.</p>
+
+  <section class="panel">
+    <div class="status">
+      <span id="statusDot" class="dot"></span>
+      <strong id="statusTitle">서버 연결 중</strong>
+      <span id="statusDetail" class="muted"></span>
+      <button id="prepareButton" type="button">모델 다시 준비</button>
+    </div>
+    <p class="muted">최초 실행은 Qwen 모델 다운로드 때문에 오래 걸릴 수 있습니다. 이 페이지를 닫지 않아도 준비 상태가 자동 갱신됩니다.</p>
+  </section>
+
+  <section class="panel">
+    <h2>로봇 마이크로 테스트</h2>
+    <p>화면을 누른 채 말하고 손가락을 떼세요. 펌웨어 재업로드는 필요 없으며, 이 비교 서버가 실행되는 동안 일반 로봇 서버는 중지되어 있어야 합니다.</p>
+    <p id="captureState" class="muted">수신된 PCM 없음</p>
+  </section>
+
+  <section class="panel">
+    <h2>저장된 WAV로 테스트</h2>
+    <p class="muted">로봇과 동일한 <code>16 kHz · 16-bit PCM · mono WAV</code>만 받습니다.</p>
+    <div class="upload">
+      <input id="wavFile" type="file" accept=".wav,audio/wav">
+      <button id="uploadButton" type="button">같은 파일 비교</button>
+      <span id="uploadState" class="muted"></span>
+    </div>
+  </section>
+
+  <main id="results"></main>
+
+  <script>
+    const expected = new Map();
+    let lastSignature = "";
+
+    const esc = (value) => String(value ?? "")
+      .replaceAll("&", "&amp;").replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+
+    function normalizeKorean(text) {
+      return String(text || "").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+    }
+
+    function editDistance(a, b) {
+      const previous = Array.from({ length: b.length + 1 }, (_, i) => i);
+      for (let i = 1; i <= a.length; i++) {
+        let diagonal = previous[0];
+        previous[0] = i;
+        for (let j = 1; j <= b.length; j++) {
+          const old = previous[j];
+          previous[j] = Math.min(
+            previous[j] + 1,
+            previous[j - 1] + 1,
+            diagonal + (a[i - 1] === b[j - 1] ? 0 : 1)
+          );
+          diagonal = old;
+        }
+      }
+      return previous[b.length];
+    }
+
+    function cer(reference, hypothesis) {
+      const ref = [...normalizeKorean(reference)];
+      const hyp = [...normalizeKorean(hypothesis)];
+      if (!ref.length) return null;
+      return editDistance(ref, hyp) / ref.length * 100;
+    }
+
+    function modelCard(job, item) {
+      const reference = expected.get(job.id) || "";
+      const score = cer(reference, item.text);
+      const scoreText = score === null ? "정답 문장을 입력하면 CER 계산" : `CER ${score.toFixed(1)}%`;
+      return `<article class="model">
+        <h3>${item.backend === "qwen" ? "Qwen3-ASR 0.6B" : "Moonshine Korean Tiny"}</h3>
+        <div class="transcript">${esc(item.text) || "<span class='muted'>(인식 결과 없음)</span>"}</div>
+        <div class="meta">처리 ${Number(item.seconds).toFixed(3)}초 ·
+          <span id="cer-${job.id}-${item.backend}">${scoreText}</span></div>
+      </article>`;
+    }
+
+    function renderResults(items) {
+      const signature = JSON.stringify(items);
+      if (signature === lastSignature) return;
+      lastSignature = signature;
+      const root = document.getElementById("results");
+      root.innerHTML = [...items].reverse().map(job => {
+        const reference = expected.get(job.id) || "";
+        let body = `<p class="muted">상태: ${esc(job.state)}</p>`;
+        if (job.state === "done") {
+          body = `<div class="reference">
+              <label for="ref-${job.id}"><strong>실제로 말한 정답 문장</strong></label>
+              <input id="ref-${job.id}" data-reference="${job.id}" type="text"
+                     value="${esc(reference)}" placeholder="예: 오늘 날씨가 정말 좋네요">
+            </div>
+            <div class="models">${job.transcriptions.map(item => modelCard(job, item)).join("")}</div>`;
+        } else if (job.state === "error") {
+          body = `<p>${esc(job.error)}</p>`;
+        }
+        return `<section class="result">
+          <h2>테스트 #${job.id}</h2>
+          <div class="meta">${esc(job.created_at)} · ${job.audio_seconds}초 · RMS ${job.rms_dbfs} dBFS · ${esc(job.source)}</div>
+          <audio controls preload="none" src="${esc(job.audio_url)}"></audio>
+          ${body}
+        </section>`;
+      }).join("");
+      document.querySelectorAll("[data-reference]").forEach(input => {
+        input.addEventListener("input", event => {
+          const id = Number(event.target.dataset.reference);
+          const reference = event.target.value;
+          expected.set(id, reference);
+          const job = items.find(item => item.id === id);
+          for (const item of job?.transcriptions || []) {
+            const score = cer(reference, item.text);
+            document.getElementById(`cer-${id}-${item.backend}`).textContent =
+              score === null ? "정답 문장을 입력하면 CER 계산" : `CER ${score.toFixed(1)}%`;
+          }
+        });
+      });
+    }
+
+    async function refresh() {
+      try {
+        const response = await fetch("/api/status", { cache: "no-store" });
+        const data = await response.json();
+        const state = data.models.state;
+        document.getElementById("statusDot").className = `dot ${state}`;
+        document.getElementById("statusTitle").textContent =
+          state === "ready" ? "두 모델 준비 완료" :
+          state === "loading" ? "모델 준비 중" :
+          state === "error" ? "모델 준비 실패" : "모델 준비 필요";
+        document.getElementById("statusDetail").textContent =
+          data.models.error || data.models.detail;
+        document.getElementById("prepareButton").disabled = state === "loading";
+        document.getElementById("captureState").textContent =
+          data.capture.bytes ? `현재 ${data.capture.seconds}초 수신됨` :
+          data.busy ? "이전 녹음을 비교하는 중입니다." : "화면 터치를 기다리는 중입니다.";
+        renderResults(data.results);
+      } catch (error) {
+        document.getElementById("statusTitle").textContent = "서버 연결 실패";
+        document.getElementById("statusDetail").textContent = String(error);
+      }
+    }
+
+    async function prepareModels() {
+      document.getElementById("prepareButton").disabled = true;
+      await fetch("/api/prepare", { method: "POST" });
+      await refresh();
+    }
+
+    document.getElementById("prepareButton").addEventListener("click", prepareModels);
+    document.getElementById("uploadButton").addEventListener("click", async () => {
+      const file = document.getElementById("wavFile").files[0];
+      const state = document.getElementById("uploadState");
+      if (!file) { state.textContent = "WAV 파일을 선택하세요."; return; }
+      state.textContent = "업로드 중...";
+      const response = await fetch("/api/audio", {
+        method: "POST",
+        headers: { "Content-Type": "audio/wav" },
+        body: await file.arrayBuffer()
+      });
+      const data = await response.json();
+      state.textContent = data.ok ? "비교 대기열에 추가했습니다." : data.error;
+      await refresh();
+    });
+
+    prepareModels();
+    refresh();
+    setInterval(refresh, 1000);
+  </script>
+</body>
+</html>

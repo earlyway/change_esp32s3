@@ -1,0 +1,7 @@
+# Isolated Qwen3-ASR 0.6B vs Moonshine Korean Tiny comparison environment.
+# Python 3.11/3.12 on an Apple Silicon Mac is required.
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+numpy>=1.24.0
+mlx-qwen3-asr==0.4.0
+moonshine-voice==0.1.5

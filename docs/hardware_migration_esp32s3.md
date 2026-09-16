@@ -140,6 +140,47 @@
   - SHA-256: `1b8c8c2a548a995f2a0a9e9b08d3dde6c6fd0beead66aba29cc749b17688b8df`
 - 두 파일은 `.gitignore`의 `*.stage-backup` 규칙으로 커밋에서 제외된다.
 
+#### TTS 연속 재생 개선 — 완료
+- [x] 16kHz/16bit mono 기준 3초(96,000바이트) FreeRTOS stream ring buffer 추가
+- [x] 250ms가 쌓이면 재생을 시작하여 초기 지연을 제한
+- [x] HTTP 수신(Core 0)과 I2S 재생(Core 1)을 별도 task로 분리
+- [x] 1초 HTTP 청크 경계의 I2S 초기화를 제거하고 전체 응답 끝에서 한 번만 초기화
+- [x] K1 PTT barge-in 시 로컬 링 버퍼 및 서버 큐를 즉시 폐기
+- [x] PSRAM 우선 할당, 실패 시 내부 RAM fallback
+- [x] PlatformIO 빌드 성공 (RAM 34.0%, Flash 34.3%)
+- [x] 사용자 하드웨어 재테스트 완료
+
+#### 컴패니언 캐릭터 UI — 완료
+- [x] 부팅 및 기본 대기 화면: `neutral` 캐릭터 애니메이션
+- [x] K1 청취 화면: `surprised` 캐릭터 애니메이션
+- [x] LLM/TTS 변환 화면: 텍스트 `THINKING` 대신 `neutral` 왕복 애니메이션
+- [x] 말하기 화면: LLM이 선택한 `positive/neutral/sad/angry/surprised` 표정
+- [x] 기존 표정별 4개 원본을 RGB565 보간하여 6개 표시 프레임(1.5배)으로 확장
+- [x] 보간용 180×180 버퍼는 PSRAM에 할당하고 실패 시 원본 프레임으로 안전하게 fallback
+- [x] 시리얼 일반 `w` 명령 제거, `Control+W`(ASCII `0x17`)로 개발자 상태 화면 토글
+- [x] 실제 보드 업로드 및 PSRAM, 디스플레이·오디오 task 초기화 확인
+- [x] 시리얼 `Control+W → 상태 화면 → Control+W → 캐릭터 UI` 왕복 검증
+
+#### Supertonic 3 TTS A/B 비교 및 통합 — 완료
+- A/B 청취 결과 Supertonic 3 F1이 더 자연스러운 음성으로 선택됐다.
+- `Run TTS A-B Test.command`가 Python 3.11/3.12 전용
+  `.venv-supertonic/` 환경을 사용한다.
+- 동일한 한국어 6문장을 macOS Yuna와 Supertonic 3 F1로 생성한다.
+- 각 음성의 원본 WAV와 실제 로봇 조건인 16kHz/16bit/mono WAV를 모두 만든다.
+- 생성 시간과 오디오 플레이어를 포함한 로컬 비교 페이지를 자동으로 연다.
+- 결과와 약 400MB 모델은 로컬에만 저장하며 Git에 포함하지 않는다.
+- Supertonic 3 v1.3.1/F1, 품질 8, 속도 1.0으로 비교 파일 24개 생성 완료
+  (6문장 × 2엔진 × 원본/16kHz).
+- 첫 모델 준비는 약 40초, 이후 문장별 합성은 약 0.75~1.97초로 측정됐다.
+- Python 3.11 전용 로컬 서비스(`127.0.0.1:3001`)가 모델을 상시 로드하고
+  44.1kHz 출력을 ESP32용 16kHz/16bit/mono PCM으로 변환한다.
+- 메인 서버의 기본 backend는 Supertonic이며 요청 실패 시 기존 macOS
+  `say`/Yuna로 자동 fallback한다.
+- `Start Robot.command`가 설치·모델 준비·서비스 시작을 자동 처리하고,
+  `Stop Robot.command`는 현재 프로젝트의 3000/3001 서버만 종료한다.
+- 서비스 health, 16kHz PCM, macOS fallback, 스피커 큐 전송을 검증했다.
+- 실제 Ollama → Supertonic → ESP32 pull 전체 흐름을 확인했다.
+
 ### (선택) 8단계. 새 기능 활용
 - 터치 (CST816D, I2C 0x15)
 - RGB LED 7개 (GPIO38)

@@ -20,3 +20,6 @@ tools/__pycache__/
 tools/*.pyc
 .robot-runtime/
 .venv/
+.venv-supertonic/
+.venv-stt-ab/
+.venv-qwen-stt/

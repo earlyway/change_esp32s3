@@ -6,12 +6,14 @@
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <Wire.h>
+#include <freertos/stream_buffer.h>
 #include <math.h>
 #include <string.h>
 #include <strings.h>
 
 #include "hardware_pins.h"
 #include "tca9555.h"
+#include "cst816d.h"
 #include "es8311.h"
 #include "es7210.h"
 #include "server_config.h"
@@ -24,7 +26,9 @@ constexpr int kTftWidth = 320;
 constexpr int kTftHeight = 240;
 Adafruit_ST7789 tft(&SPI, PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST);
 TCA9555 exio(I2C_ADDR_TCA9555);
+CST816D touch(I2C_ADDR_CST816D);
 bool displayReady = false;
+bool touchReady = false;
 
 // Waveshare audio board: ES7210 microphones and ES8311 speaker share I2S0.
 constexpr i2s_port_t I2S_PORT = I2S_NUM_0;
@@ -35,11 +39,68 @@ es8311_handle_t speakerCodec = nullptr;
 es7210_dev_handle_t micCodec = nullptr;
 bool micReady = false;
 bool speakerReady = false;
+constexpr int kDefaultSpeakerVolume = 90;
+constexpr int kSpeakerVolumeStep = 10;
+volatile int speakerVolume = kDefaultSpeakerVolume;
 
-// Phase 1 downlink: network task GETs PCM and streams it to I2S in small
-// blocks so we do not keep a 1-second buffer in DRAM. loop() (PTT, q/w)
-// keeps running; mic HTTP upload waits until the current clip chunk finishes.
+enum TestTune : int {
+  kTuneNone = 0,
+  kTuneBeep = 1,
+  kTuneRedRed = 2,
+};
+int testTunePlaying = kTuneNone;
+int pendingSerialChar = -1;
+
+int readSerialChar() {
+  if (pendingSerialChar >= 0) {
+    const int c = pendingSerialChar;
+    pendingSerialChar = -1;
+    return c;
+  }
+  if (Serial.available() > 0) return Serial.read();
+  return -1;
+}
+
+bool testTuneStopRequested() {
+  while (true) {
+    const int c = (pendingSerialChar >= 0 || Serial.available() > 0)
+                      ? readSerialChar()
+                      : -1;
+    if (c < 0) return false;
+    const bool stopBeep = testTunePlaying == kTuneBeep && (c == 'b' || c == 'B');
+    const bool stopRedRed =
+        testTunePlaying == kTuneRedRed && (c == 'p' || c == 'P');
+    if (!stopBeep && !stopRedRed) {
+      pendingSerialChar = c;
+      return false;
+    }
+    // Drop extra repeats of the same key so loop() does not restart playback.
+    while (Serial.available() > 0) {
+      const int next = Serial.peek();
+      if ((stopBeep && (next == 'b' || next == 'B')) ||
+          (stopRedRed && (next == 'p' || next == 'P'))) {
+        Serial.read();
+      } else {
+        break;
+      }
+    }
+    return true;
+  }
+}
+
+// Speaker downlink uses a 3-second ring buffer. The network task fills it while
+// a dedicated playback task drains it, so one-second HTTP chunk boundaries do
+// not reset I2S or create audible gaps.
+constexpr size_t kSpeakerBytesPerSecond = AUDIO_SAMPLE_RATE * sizeof(int16_t);
+constexpr size_t kSpeakerRingBytes = kSpeakerBytesPerSecond * 3;
+constexpr size_t kSpeakerPrebufferBytes = kSpeakerBytesPerSecond / 4; // 250 ms
+StreamBufferHandle_t speakerPcmStream = nullptr;
+StaticStreamBuffer_t speakerPcmStreamControl;
+uint8_t* speakerPcmStorage = nullptr;
 volatile bool speakerDownlinkPlaying = false;
+volatile bool speakerStreamOpen = false;
+volatile bool speakerStreamEndPending = false;
+volatile uint32_t speakerLastDataMs = 0;
 char speakerEmotion[24] = "none";
 // Phase 4: -1 = no face. faceHoldUntilMs is millis() deadline (Arduino wrap-safe).
 volatile int faceEmotionIndex = -1;
@@ -79,17 +140,56 @@ const char* netActivityName(int a) {
   }
 }
 
-// 16kHz, 16-bit Mono PCM Chunk configs (1 second chunk = 16000 samples = 32000 bytes)
+// 16kHz, 16-bit Mono PCM. Three buffers let one chunk POST while another waits
+// and capture continues, so a slow upload no longer drops the next second or
+// the PTT tail.
 constexpr size_t kChunkSamples = 16000;
-int16_t audioBufferA[kChunkSamples];
-int16_t audioBufferB[kChunkSamples];
-
-int16_t* activeWriteBuffer = audioBufferA;
+int16_t micBuffers[3][kChunkSamples];
+int16_t* activeWriteBuffer = micBuffers[0];
 volatile int16_t* activeSendBuffer = nullptr;
+volatile int16_t* pendingSendBuffer = nullptr;
 volatile size_t writeIndex = 0;
 volatile size_t sendBufferSize = 0;
+volatile size_t pendingSendSize = 0;
 
 SemaphoreHandle_t xSendSemaphore = nullptr;
+
+int16_t* unusedMicBuffer() {
+  for (int i = 0; i < 3; ++i) {
+    int16_t* candidate = micBuffers[i];
+    if (candidate != activeWriteBuffer &&
+        candidate != activeSendBuffer &&
+        candidate != pendingSendBuffer) {
+      return candidate;
+    }
+  }
+  return nullptr;
+}
+
+// Queue a captured buffer for POST. If both slots are full, keep the in-flight
+// POST and replace the waiting chunk with fresher audio (especially the PTT
+// tail) instead of dropping the newest second.
+bool enqueueMicChunk(int16_t* buf, size_t bytes, bool isTail) {
+  if (bytes < 2) {
+    return false;
+  }
+  if (activeSendBuffer == nullptr) {
+    activeSendBuffer = buf;
+    sendBufferSize = bytes;
+    xSemaphoreGive(xSendSemaphore);
+    return true;
+  }
+  if (pendingSendBuffer == nullptr) {
+    pendingSendBuffer = buf;
+    pendingSendSize = bytes;
+    return true;
+  }
+  pendingSendBuffer = buf;
+  pendingSendSize = bytes;
+  Serial.printf("[Task] Replaced waiting chunk with %s\n",
+                isTail ? "PTT tail" : "newer audio");
+  return true;
+}
 
 // dBFS calculations for 16-bit PCM from ES7210.
 constexpr int32_t kFullScale = 32768;
@@ -110,11 +210,16 @@ volatile uint32_t postedChunks = 0;
 volatile int lastHttpCode = 0;
 volatile uint32_t lastHttpDurationMs = 0;
 
-// Push-to-talk: audio is captured/uploaded only while the mic button is held.
+// Push-to-talk: audio is captured/uploaded only while a finger is on the LCD.
 volatile bool micActive = false;
 
-// TFT display mode. Toggled from serial: 'q' -> animation, 'w' -> status screen.
-constexpr uint32_t kAnimationFrameIntervalMs = 100; // 10 fps
+// Character UI is the default. Ctrl+W toggles the developer status screen;
+// 'q' still runs the full emotion demo while idle.
+constexpr uint32_t kSpeakFrameIntervalMs = 70;
+constexpr uint32_t kListenFrameIntervalMs = 80;
+constexpr uint32_t kThinkFrameIntervalMs = 100;
+constexpr uint32_t kIdleFrameIntervalMs = 120;
+volatile bool diagnosticDisplayMode = false;
 volatile bool animationMode = false;
 
 float magnitudeToDbfs(int32_t magnitude) {
@@ -160,18 +265,7 @@ void printDbfsBar() {
   stats = LevelStats{};
 }
 
-void drawBootStatus(const char* line1, const char* line2 = "", const char* line3 = "", const char* line4 = "") {
-  if (!displayReady) return;
-
-  tft.fillScreen(ST77XX_BLACK);
-  tft.setTextSize(2);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(0, 0);
-  tft.println(line1);
-  if (line2[0] != '\0') tft.println(line2);
-  if (line3[0] != '\0') tft.println(line3);
-  if (line4[0] != '\0') tft.println(line4);
-}
+void drawEmotionFrame(int emotion, size_t localIndex);
 
 bool initDisplay() {
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, 400000);
@@ -182,6 +276,7 @@ bool initDisplay() {
 
   exio.pinMode(EXIO_LCD_RST, OUTPUT);
   exio.pinMode(EXIO_TP_RST, OUTPUT);
+  exio.pinMode(EXIO_TP_INT, INPUT);
   exio.pinMode(EXIO_PA_CTRL, OUTPUT);
   exio.pinMode(EXIO_KEY1, INPUT);
   exio.pinMode(EXIO_KEY2, INPUT);
@@ -203,7 +298,14 @@ bool initDisplay() {
   tft.fillScreen(ST77XX_BLACK);
 
   displayReady = true;
-  drawBootStatus("ESP32 STT Streamer", "TFT: OK", "Booting...");
+  touchReady = touch.begin();
+  if (touchReady) {
+    Serial.printf("[Touch] CST816D ready chip=0x%02X (hold the LCD to capture)\n",
+                  touch.chipId());
+  } else {
+    Serial.println("[Touch] CST816D not found; PTT disabled");
+  }
+  drawEmotionFrame(ANIM_EMOTION_NEUTRAL, 0);
   Serial.printf("[TFT] Init OK (%dx%d) CS=%d DC=%d RST=%d\n",
                 tft.width(), tft.height(),
                 PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST);
@@ -248,8 +350,8 @@ int effectiveUi(uint32_t now) {
   if (micActive) {
     return kUiListen;
   }
-  // Keep the face up while PCM plays and across the short gap between 1 s chunks.
-  if (speakerDownlinkPlaying || faceHoldActive(now)) {
+  // Keep the face up while PCM is being received, buffered, or played.
+  if (speakerStreamOpen || speakerDownlinkPlaying || faceHoldActive(now)) {
     return kUiSpeak;
   }
   if (serverRobotState == kUiThink || serverRobotState == kUiSpeak) {
@@ -317,6 +419,9 @@ void drawStatusScreen() {
   drawStatusRow(168, "Chunks: ", chunks);
   drawStatusRow(192, "Spk: ",   speakerDownlinkPlaying ? "PLAY" : "IDLE",
                 speakerDownlinkPlaying ? ST77XX_GREEN : ST77XX_WHITE);
+  char volume[16];
+  snprintf(volume, sizeof(volume), "%d", speakerVolume);
+  drawStatusRow(216, "Vol: ", volume);
 }
 
 void drawAnimationFrame(size_t frameIndex) {
@@ -327,12 +432,12 @@ void drawAnimationFrame(size_t frameIndex) {
 
 int emotionIndexFromTag(const char* tag) {
   if (tag == nullptr || tag[0] == '\0') {
-    return -1;
+    return ANIM_EMOTION_NEUTRAL;
   }
   if (strcasecmp(tag, "positive") == 0) {
     return ANIM_EMOTION_POSITIVE;
   }
-  if (strcasecmp(tag, "neutral") == 0) {
+  if (strcasecmp(tag, "neutral") == 0 || strcasecmp(tag, "none") == 0) {
     return ANIM_EMOTION_NEUTRAL;
   }
   if (strcasecmp(tag, "sad") == 0) {
@@ -344,14 +449,20 @@ int emotionIndexFromTag(const char* tag) {
   if (strcasecmp(tag, "surprised") == 0) {
     return ANIM_EMOTION_SURPRISED;
   }
-  return -1;
+  return ANIM_EMOTION_NEUTRAL;
 }
 
 void drawEmotionFrame(int emotion, size_t localIndex) {
   constexpr int16_t x = (kTftWidth - ANIM_FRAME_WIDTH) / 2;
   constexpr int16_t y = (kTftHeight - ANIM_FRAME_HEIGHT) / 2;
+  if (emotion < 0 || emotion >= ANIM_EMOTION_COUNT) {
+    emotion = ANIM_EMOTION_NEUTRAL;
+  }
+  localIndex %= ANIM_FRAMES_PER_EMOTION;
   tft.drawRGBBitmap(
-      x, y, animEmotionFrames[emotion][localIndex], ANIM_FRAME_WIDTH, ANIM_FRAME_HEIGHT);
+      x, y,
+      animEmotionFrames[emotion][localIndex],
+      ANIM_FRAME_WIDTH, ANIM_FRAME_HEIGHT);
 }
 
 void displayTask(void* pvParameters) {
@@ -362,64 +473,90 @@ void displayTask(void* pvParameters) {
   int lastFaceEmotion = -1;
   uint32_t lastStatusMs = 0;
   uint32_t lastAnimMs = 0;
-  bool wasAnimating = false;
   int lastDrawnUi = -1;
+  bool lastDiagnosticMode = false;
+  bool showingDemo = false;
+  int thinkDirection = 1;
 
   while (true) {
     if (displayReady) {
       uint32_t now = millis();
       const int ui = effectiveUi(now);
       logUiIfChanged(ui);
-      const int face = faceEmotionIndex;
-      const bool showFace = (ui == kUiSpeak && faceHoldActive(now));
 
-      if (ui == kUiThink) {
-        lastFaceEmotion = -1;
-        if (lastDrawnUi != kUiThink) {
-          drawThinkingScreen();
-          wasAnimating = true;
-        }
-      } else if (showFace) {
-        if (!wasAnimating || lastFaceEmotion != face || lastDrawnUi != kUiSpeak) {
+      if (diagnosticDisplayMode) {
+        if (!lastDiagnosticMode) {
           tft.fillScreen(ST77XX_BLACK);
-          wasAnimating = true;
-          lastFaceEmotion = face;
-          faceFrameIndex = 0;
         }
-        if (now - lastAnimMs >= kAnimationFrameIntervalMs) {
-          lastAnimMs = now;
-          drawEmotionFrame(face, faceFrameIndex);
-          faceFrameIndex = (faceFrameIndex + 1) % ANIM_FRAMES_PER_EMOTION;
+        if (!lastDiagnosticMode || now - lastStatusMs >= 500) {
+          lastStatusMs = now;
+          drawStatusScreen();
         }
       } else if (animationMode && ui == kUiIdle) {
-        lastFaceEmotion = -1;
-        if (!wasAnimating) {
+        if (!showingDemo || lastDiagnosticMode) {
           tft.fillScreen(ST77XX_BLACK);
-          wasAnimating = true;
+          showingDemo = true;
+          animFrameIndex = 0;
         }
-        if (now - lastAnimMs >= kAnimationFrameIntervalMs) {
+        if (now - lastAnimMs >= kSpeakFrameIntervalMs) {
           lastAnimMs = now;
           drawAnimationFrame(animFrameIndex);
           animFrameIndex++;
           if (animFrameIndex >= ANIM_FRAME_COUNT) {
             animFrameIndex = 0;
             animationMode = false;
-            Serial.println("[Display] Animation finished, back to status screen");
+            Serial.println("[Display] Animation finished, back to character UI");
           }
         }
       } else {
-        if (wasAnimating || lastDrawnUi != ui) {
+        int face = ANIM_EMOTION_NEUTRAL;
+        if (ui == kUiListen) {
+          face = ANIM_EMOTION_SURPRISED;
+        } else if (ui == kUiSpeak) {
+          face = faceEmotionIndex >= 0 ? faceEmotionIndex : ANIM_EMOTION_NEUTRAL;
+        }
+
+        const bool stateChanged =
+            lastDiagnosticMode || showingDemo ||
+            lastDrawnUi != ui || lastFaceEmotion != face;
+        if (stateChanged) {
           tft.fillScreen(ST77XX_BLACK);
-          wasAnimating = false;
+          faceFrameIndex = 0;
+          thinkDirection = 1;
+          drawEmotionFrame(face, faceFrameIndex);
+          lastAnimMs = now;
         }
-        lastFaceEmotion = -1;
+
+        uint32_t interval = kSpeakFrameIntervalMs;
+        if (ui == kUiIdle) {
+          interval = kIdleFrameIntervalMs;
+        } else if (ui == kUiListen) {
+          interval = kListenFrameIntervalMs;
+        } else if (ui == kUiThink) {
+          interval = kThinkFrameIntervalMs;
+        }
+
+        if (!stateChanged && now - lastAnimMs >= interval) {
+          lastAnimMs = now;
+          if (ui == kUiThink) {
+            if (faceFrameIndex == ANIM_FRAMES_PER_EMOTION - 1) {
+              thinkDirection = -1;
+            } else if (faceFrameIndex == 0) {
+              thinkDirection = 1;
+            }
+            faceFrameIndex =
+                static_cast<size_t>(static_cast<int>(faceFrameIndex) + thinkDirection);
+          } else {
+            faceFrameIndex = (faceFrameIndex + 1) % ANIM_FRAMES_PER_EMOTION;
+          }
+          drawEmotionFrame(face, faceFrameIndex);
+        }
+
+        showingDemo = false;
         animFrameIndex = 0;
-        faceFrameIndex = 0;
-        if (now - lastStatusMs >= 500 || lastDrawnUi != ui) {
-          lastStatusMs = now;
-          drawStatusScreen();
-        }
+        lastFaceEmotion = face;
       }
+      lastDiagnosticMode = diagnosticDisplayMode;
       lastDrawnUi = ui;
     }
 
@@ -499,7 +636,12 @@ bool setupAudioCodecs() {
   result = es8311_init(
       speakerCodec, &speakerClock, ES8311_RESOLUTION_16, ES8311_RESOLUTION_16);
   if (result == ESP_OK) {
-    result = es8311_voice_volume_set(speakerCodec, 70, nullptr);
+    int applied = kDefaultSpeakerVolume;
+    result = es8311_voice_volume_set(
+        speakerCodec, kDefaultSpeakerVolume, &applied);
+    if (result == ESP_OK) {
+      speakerVolume = applied;
+    }
   }
   if (result == ESP_OK) {
     result = es8311_microphone_config(speakerCodec, false);
@@ -520,7 +662,8 @@ bool setupAudioCodecs() {
 
 // Play a single sine tone (freqHz == 0 -> silence/rest). Blocking.
 // A short linear fade-in/out envelope avoids click noise between notes.
-void playTone(float freqHz, uint32_t durationMs, int16_t amplitude = 28000) {
+// Returns true if the matching serial key stopped playback early.
+bool playTone(float freqHz, uint32_t durationMs, int16_t amplitude = 28000) {
   constexpr size_t kBlockFrames = 128;
   constexpr uint32_t kFadeMs = 6;
 
@@ -530,6 +673,7 @@ void playTone(float freqHz, uint32_t durationMs, int16_t amplitude = 28000) {
   int16_t block[kBlockFrames * 2]; // interleaved stereo (L, R per frame)
   size_t written = 0;
   while (written < totalFrames) {
+    if (testTuneStopRequested()) return true;
     size_t count = min(kBlockFrames, totalFrames - written);
     for (size_t i = 0; i < count; ++i) {
       size_t n = written + i;
@@ -552,6 +696,23 @@ void playTone(float freqHz, uint32_t durationMs, int16_t amplitude = 28000) {
     i2s_write(SPK_I2S_PORT, block, count * 2 * sizeof(int16_t), &bytesWritten, portMAX_DELAY);
     written += count;
   }
+  return false;
+}
+
+void applySpeakerVolume(int volume) {
+  if (volume < 0) volume = 0;
+  if (volume > 100) volume = 100;
+  if (!speakerReady || speakerCodec == nullptr) {
+    Serial.println("[Speaker] volume ignored; codec not ready");
+    return;
+  }
+  int applied = volume;
+  if (es8311_voice_volume_set(speakerCodec, volume, &applied) != ESP_OK) {
+    Serial.println("[Speaker] volume set failed");
+    return;
+  }
+  speakerVolume = applied;
+  Serial.printf("[Speaker] volume=%d\n", applied);
 }
 
 // Play a short 440Hz sine beep (~0.5s) through ES8311. Blocking.
@@ -560,14 +721,16 @@ void playTestBeep() {
     Serial.println("[Speaker] Not initialized, cannot beep");
     return;
   }
-  if (speakerDownlinkPlaying) {
+  if (speakerStreamOpen || speakerDownlinkPlaying) {
     Serial.println("[Speaker] Downlink playing, skip test beep");
     return;
   }
-  Serial.println("[Speaker] Test beep start (440Hz, 0.5s)");
-  playTone(440.0f, 500);
+  Serial.println("[Speaker] Test beep start (440Hz, 0.5s); press b again to stop");
+  testTunePlaying = kTuneBeep;
+  const bool stopped = playTone(440.0f, 500);
+  testTunePlaying = kTuneNone;
   i2s_zero_dma_buffer(SPK_I2S_PORT);
-  Serial.println("[Speaker] Test beep done");
+  Serial.println(stopped ? "[Speaker] Test beep stopped" : "[Speaker] Test beep done");
 }
 
 // Note frequencies (Hz), 4th-6th octave.
@@ -751,13 +914,13 @@ float synthBeatHiHat(float triggerPosition) {
 }
 
 // Render and play REDRED (melody table + drum grid) once, blocking (~34s).
-// loop() (button, serial keys) does not run until playback finishes.
+// The matching serial key ('p') can stop playback in the middle of a block.
 void playRedRedBeat() {
   if (!speakerReady) {
     Serial.println("[Speaker] Not initialized, cannot play beat");
     return;
   }
-  if (speakerDownlinkPlaying) {
+  if (speakerStreamOpen || speakerDownlinkPlaying) {
     Serial.println("[Speaker] Downlink playing, skip REDRED");
     return;
   }
@@ -772,10 +935,12 @@ void playRedRedBeat() {
     totalSamples += static_cast<uint32_t>(AUDIO_SAMPLE_RATE) * kRedRedMelody[i].durationMs / 1000;
   }
 
-  Serial.printf("[Speaker] REDRED beat start (%u notes, %.0f BPM, ~%us)\n",
+  Serial.printf("[Speaker] REDRED beat start (%u notes, %.0f BPM, ~%us); "
+                "press p again to stop\n",
                 static_cast<unsigned>(kNoteCount), static_cast<double>(kBeatBpm),
                 static_cast<unsigned>(totalSamples / AUDIO_SAMPLE_RATE));
 
+  testTunePlaying = kTuneRedRed;
   int16_t block[kBlockFrames * 2]; // interleaved stereo (L, R per frame)
   size_t noteIndex = 0;
   uint32_t noteStartSample = 0;
@@ -784,6 +949,12 @@ void playRedRedBeat() {
   uint32_t sampleIndex = 0;
 
   while (sampleIndex < totalSamples) {
+    if (testTuneStopRequested()) {
+      i2s_zero_dma_buffer(SPK_I2S_PORT);
+      testTunePlaying = kTuneNone;
+      Serial.println("[Speaker] REDRED beat stopped");
+      return;
+    }
     size_t count = min(kBlockFrames, static_cast<size_t>(totalSamples - sampleIndex));
 
     for (size_t i = 0; i < count; ++i) {
@@ -838,6 +1009,7 @@ void playRedRedBeat() {
   }
 
   i2s_zero_dma_buffer(SPK_I2S_PORT);
+  testTunePlaying = kTuneNone;
   Serial.println("[Speaker] REDRED beat done");
 }
 
@@ -890,14 +1062,15 @@ void flushSpeakerQueue(const String& flushUrl) {
   Serial.printf("[Speaker] flush HTTP %d %s\n", code, body.c_str());
 }
 
-void postUtteranceEnd(const String& endUrl) {
+bool postUtteranceEnd(const String& endUrl) {
   netActivity = kNetEnd;
   HTTPClient http;
   http.setConnectTimeout(1000);
   http.setTimeout(3000);
   if (!http.begin(endUrl)) {
     netActivity = kNetIdle;
-    return;
+    Serial.println("[HTTP] utterance/end begin failed");
+    return false;
   }
   http.addHeader("Content-Type", "application/json");
   const uint32_t t0 = millis();
@@ -908,11 +1081,12 @@ void postUtteranceEnd(const String& endUrl) {
   netActivity = kNetIdle;
   Serial.printf("[HTTP] utterance/end -> %d %s (took %u ms)\n",
                 code, body.c_str(), static_cast<unsigned>(millis() - t0));
+  return code == 200;
 }
 
 // Returns true when a PCM chunk was received (caller should poll again soon).
 bool pollSpeakerPull(const String& pullUrl) {
-  if (!speakerReady || speakerDownlinkPlaying) {
+  if (!speakerReady || speakerPcmStream == nullptr) {
     return false;
   }
 
@@ -929,8 +1103,8 @@ bool pollSpeakerPull(const String& pullUrl) {
   http.collectHeaders(headerKeys, 3);
 
   int httpCode = http.GET();
-  applyServerRobotState(http.header("X-Robot-State"));
   if (httpCode == 204 || httpCode == HTTP_CODE_NO_CONTENT) {
+    applyServerRobotState(http.header("X-Robot-State"));
     http.end();
     netActivity = kNetIdle;
     return false;
@@ -941,8 +1115,6 @@ bool pollSpeakerPull(const String& pullUrl) {
     } else {
       Serial.printf("[Speaker] pull HTTP %d\n", httpCode);
     }
-    // Server unreachable: do not keep a stale thinking/speaking screen.
-    serverRobotState = kUiIdle;
     http.end();
     netActivity = kNetIdle;
     return false;
@@ -956,6 +1128,11 @@ bool pollSpeakerPull(const String& pullUrl) {
     strncpy(speakerEmotion, "none", sizeof(speakerEmotion) - 1);
   }
 
+  // Mark the stream open before applying a possible idle state so the face
+  // does not flash think/idle for one frame on the last (or first) chunk.
+  speakerStreamOpen = true;
+  applyServerRobotState(http.header("X-Robot-State"));
+
   int len = http.getSize();
   WiFiClient* stream = http.getStreamPtr();
   if (stream == nullptr) {
@@ -965,13 +1142,16 @@ bool pollSpeakerPull(const String& pullUrl) {
   }
   stream->setTimeout(50);
 
-  speakerDownlinkPlaying = true;
+  speakerStreamEndPending = false;
   faceEmotionIndex = emotionIndexFromTag(speakerEmotion);
   faceHoldUntilMs = millis() + 60000;
-  Serial.printf("[Speaker] pull start emotion=%s content_length=%d\n", speakerEmotion, len);
+  Serial.printf("[Speaker] receive start emotion=%s content_length=%d buffered=%u\n",
+                speakerEmotion,
+                len,
+                static_cast<unsigned>(xStreamBufferBytesAvailable(speakerPcmStream)));
 
-  constexpr size_t kScratchSamples = 128;
-  int16_t scratch[kScratchSamples];
+  constexpr size_t kScratchBytes = 1024;
+  uint8_t scratch[kScratchBytes];
   size_t totalBytes = 0;
   uint32_t idleMs = 0;
   const uint32_t kIdleGiveUpMs = 400;
@@ -994,7 +1174,7 @@ bool pollSpeakerPull(const String& pullUrl) {
       break;
     }
     const int avail = stream->available();
-    if (avail < 2) {
+    if (avail < 1) {
       vTaskDelay(pdMS_TO_TICKS(5));
       idleMs += 5;
       if (idleMs >= kIdleGiveUpMs) {
@@ -1016,7 +1196,7 @@ bool pollSpeakerPull(const String& pullUrl) {
       break;
     }
 
-    const int got = stream->read(reinterpret_cast<uint8_t*>(scratch), want);
+    const int got = stream->read(scratch, want);
     if (got <= 0) {
       vTaskDelay(pdMS_TO_TICKS(5));
       idleMs += 5;
@@ -1033,32 +1213,173 @@ bool pollSpeakerPull(const String& pullUrl) {
     if (evenGot < 2) {
       break;
     }
-    playPcmMono16(scratch, static_cast<size_t>(evenGot) / sizeof(int16_t));
-    totalBytes += static_cast<size_t>(evenGot);
+
+    size_t queued = 0;
+    while (queued < static_cast<size_t>(evenGot) && !speakerBargeIn) {
+      const size_t sent = xStreamBufferSend(
+          speakerPcmStream,
+          scratch + queued,
+          static_cast<size_t>(evenGot) - queued,
+          pdMS_TO_TICKS(100));
+      if (sent == 0) {
+        continue;
+      }
+      queued += sent;
+      speakerLastDataMs = millis();
+    }
+    totalBytes += queued;
     if (len > 0) {
       remaining -= evenGot;
     }
-    vTaskDelay(1);
   }
 
   http.end();
   netActivity = kNetIdle;
+  if (speakerBargeIn) {
+    Serial.println("[Speaker] receive abort: barge-in");
+  } else if (serverRobotState != kUiSpeak) {
+    // The server removes a chunk from its queue before responding. If the
+    // resulting state is no longer "speaking", this response is the final
+    // chunk; playback owns the final drain and the single I2S reset.
+    speakerStreamEndPending = true;
+  }
+
+  Serial.printf("[Speaker] receive done bytes=%u (~%u ms) buffered=%u end=%d\n",
+                static_cast<unsigned>(totalBytes),
+                static_cast<unsigned>(totalBytes / 2 * 1000 / AUDIO_SAMPLE_RATE),
+                static_cast<unsigned>(xStreamBufferBytesAvailable(speakerPcmStream)),
+                speakerStreamEndPending ? 1 : 0);
+  return true;
+}
+
+void discardBufferedSpeakerPcm() {
+  if (speakerPcmStream == nullptr) return;
+  uint8_t discard[512];
+  while (xStreamBufferReceive(speakerPcmStream, discard, sizeof(discard), 0) > 0) {
+  }
+}
+
+void finishSpeakerPlayback(bool bargedIn) {
+  discardBufferedSpeakerPcm();
+  if (!bargedIn) {
+    // i2s_write() returns after copying into the eight 256-frame DMA buffers.
+    // Let their final ~128 ms reach the codec before clearing them, otherwise
+    // the last Korean syllable can be clipped.
+    for (int i = 0; i < 14; ++i) {
+      if (speakerBargeIn) {
+        bargedIn = true;
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+  }
   i2s_zero_dma_buffer(SPK_I2S_PORT);
   speakerDownlinkPlaying = false;
-  if (speakerBargeIn) {
+  speakerStreamOpen = false;
+  speakerStreamEndPending = false;
+
+  if (bargedIn) {
     faceEmotionIndex = -1;
     faceHoldUntilMs = millis();
     serverRobotState = kUiIdle;
-  } else if (serverRobotState == kUiSpeak) {
-    // More chunks are queued on the Mac: hold the face across the pull gap.
-    faceHoldUntilMs = millis() + 1500;
+    Serial.println("[Speaker] buffered playback stopped by PTT");
   } else {
     faceHoldUntilMs = millis() + 400;
+    Serial.println("[Speaker] buffered playback complete");
   }
-  Serial.printf("[Speaker] pull done bytes=%u (~%u ms)\n",
-                static_cast<unsigned>(totalBytes),
-                static_cast<unsigned>(totalBytes / 2 * 1000 / AUDIO_SAMPLE_RATE));
-  return true;
+}
+
+void speakerPlaybackTask(void* pvParameters) {
+  Serial.printf("[Task] Speaker playback task started on Core 1 (ring=%u bytes, prebuffer=%u ms)\n",
+                static_cast<unsigned>(kSpeakerRingBytes),
+                static_cast<unsigned>(kSpeakerPrebufferBytes * 1000 / kSpeakerBytesPerSecond));
+
+  if (!speakerReady || speakerPcmStream == nullptr) {
+    Serial.println("[Task] Speaker ring buffer unavailable! Task suspending.");
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  constexpr size_t kPlaybackSamples = 256;
+  int16_t samples[kPlaybackSamples];
+  bool bargeHandled = false;
+
+  while (true) {
+    if (speakerBargeIn) {
+      if (!bargeHandled) {
+        finishSpeakerPlayback(true);
+        bargeHandled = true;
+      }
+      vTaskDelay(pdMS_TO_TICKS(5));
+      continue;
+    }
+    bargeHandled = false;
+
+    const size_t buffered = xStreamBufferBytesAvailable(speakerPcmStream);
+    if (!speakerDownlinkPlaying) {
+      const bool readyToStart =
+          speakerStreamOpen &&
+          (buffered >= kSpeakerPrebufferBytes ||
+           (speakerStreamEndPending && buffered > 0));
+      if (!readyToStart) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+        continue;
+      }
+
+      speakerDownlinkPlaying = true;
+      faceEmotionIndex = emotionIndexFromTag(speakerEmotion);
+      faceHoldUntilMs = millis() + 60000;
+      // Fill the eight 256-frame TX DMA buffers (~128 ms) before any Serial
+      // I/O. TX auto-clear would otherwise play zeros while this task logs,
+      // which clips the first Korean syllable.
+      constexpr size_t kPrimeBytes = 2048 * sizeof(int16_t);
+      size_t primed = 0;
+      while (primed < kPrimeBytes && !speakerBargeIn) {
+        const size_t got = xStreamBufferReceive(
+            speakerPcmStream, samples, sizeof(samples), 0);
+        const size_t even = got & ~static_cast<size_t>(1);
+        if (even < 2) {
+          break;
+        }
+        playPcmMono16(samples, even / sizeof(int16_t));
+        primed += even;
+      }
+      Serial.printf("[Speaker] buffered playback start bytes=%u primed=%u\n",
+                    static_cast<unsigned>(buffered),
+                    static_cast<unsigned>(primed));
+    }
+
+    const size_t received = xStreamBufferReceive(
+        speakerPcmStream, samples, sizeof(samples), pdMS_TO_TICKS(20));
+    const size_t evenBytes = received & ~static_cast<size_t>(1);
+    if (evenBytes > 0) {
+      playPcmMono16(samples, evenBytes / sizeof(int16_t));
+      continue;
+    }
+
+    if (speakerStreamEndPending &&
+        xStreamBufferBytesAvailable(speakerPcmStream) == 0) {
+      finishSpeakerPlayback(false);
+      continue;
+    }
+
+    if (speakerDownlinkPlaying && speakerStreamOpen && !speakerStreamEndPending) {
+      static uint32_t lastUnderrunLogMs = 0;
+      const uint32_t nowMs = millis();
+      if (nowMs - lastUnderrunLogMs > 250) {
+        lastUnderrunLogMs = nowMs;
+        Serial.printf("[Speaker] ring underrun buffered=%u\n",
+                      static_cast<unsigned>(xStreamBufferBytesAvailable(speakerPcmStream)));
+      }
+    }
+
+    // Recover from a lost final response without leaving the UI permanently
+    // speaking. Normal one-second chunk boundaries are far below this timeout.
+    if (speakerStreamOpen && serverRobotState != kUiSpeak &&
+        millis() - speakerLastDataMs > 2000) {
+      speakerStreamEndPending = true;
+    }
+  }
 }
 
 // WiFi status helpers
@@ -1082,13 +1403,23 @@ void audioTask(void* pvParameters) {
   Serial.println("[Task] ES7210 capture ready");
 
   bool wasCapturing = false;
-  constexpr size_t kMinTailSamples = AUDIO_SAMPLE_RATE / 4; // 250 ms of real audio
+  constexpr size_t kMinTailSamples = AUDIO_SAMPLE_RATE / 50; // 20 ms of real audio
 
   while (true) {
     size_t bytesRead = 0;
-    esp_err_t result = i2s_read(I2S_PORT, i2sRawBuffer, sizeof(i2sRawBuffer), &bytesRead, pdMS_TO_TICKS(100));
+    // During speaker playback the same I2S port is also transmitting. A blocking
+    // RX wait holds the driver lock and lets TX DMA auto-clear, which sounds
+    // like the first 1–2 syllables dropping out.
+    const TickType_t readWait =
+        speakerDownlinkPlaying ? 0 : pdMS_TO_TICKS(100);
+    esp_err_t result = i2s_read(
+        I2S_PORT, i2sRawBuffer, sizeof(i2sRawBuffer), &bytesRead, readWait);
 
     if (result != ESP_OK || bytesRead == 0) {
+      if (speakerDownlinkPlaying) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+        continue;
+      }
       Serial.printf("[Task] I2S read error: %d, bytes=%u\n", result, bytesRead);
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
@@ -1096,30 +1427,29 @@ void audioTask(void* pvParameters) {
 
     size_t framesRead = bytesRead / (2 * sizeof(i2sRawBuffer[0]));
 
-    // Push-to-talk gate: when the mic button is not held, keep draining I2S DMA
+    // Push-to-talk gate: when the LCD is not being touched, keep draining I2S DMA
     // (so it never stalls) and keep the level meter alive, but do not accumulate
     // or transmit any audio chunks.
     bool capturing = micActive;
 
-    // Button just released: the last partial second holds the end of the
-    // sentence. Zero-pad it to a full chunk and send it instead of dropping it
-    // (unless it is too short to contain speech).
+    // Finger just lifted: send the last partial second unpadded so trailing
+    // speech is not turned into silence by zero fill.
     if (wasCapturing && !capturing) {
       if (writeIndex >= kMinTailSamples) {
-        if (activeSendBuffer == nullptr) {
-          memset(activeWriteBuffer + writeIndex, 0, (kChunkSamples - writeIndex) * sizeof(int16_t));
-          activeSendBuffer = activeWriteBuffer;
-          sendBufferSize = kChunkSamples * sizeof(int16_t);
-          activeWriteBuffer = (activeWriteBuffer == audioBufferA) ? audioBufferB : audioBufferA;
-          Serial.printf("[Task] Tail chunk: %u ms padded\n",
-                        static_cast<unsigned>(writeIndex * 1000 / AUDIO_SAMPLE_RATE));
-          xSemaphoreGive(xSendSemaphore);
+        const size_t tailBytes = writeIndex * sizeof(int16_t);
+        const unsigned tailMs =
+            static_cast<unsigned>(writeIndex * 1000 / AUDIO_SAMPLE_RATE);
+        if (enqueueMicChunk(activeWriteBuffer, tailBytes, true)) {
+          int16_t* next = unusedMicBuffer();
+          if (next != nullptr) {
+            activeWriteBuffer = next;
+          }
+          Serial.printf("[Task] Tail chunk: %u ms unpadded\n", tailMs);
         } else {
-          Serial.println("[Task] Tail chunk dropped (network busy)");
+          Serial.println("[Task] Tail chunk dropped");
         }
       }
       writeIndex = 0;
-      // Semaphore (if any) is already given, so the end marker is sent after it.
       pttEndPending = true;
     }
     wasCapturing = capturing;
@@ -1150,18 +1480,13 @@ void audioTask(void* pvParameters) {
 
       // Check if buffer is full (1 second worth of audio)
       if (writeIndex >= kChunkSamples) {
-        if (activeSendBuffer == nullptr) {
-          // Swap buffers
-          activeSendBuffer = activeWriteBuffer;
-          sendBufferSize = kChunkSamples * sizeof(int16_t);
-
-          activeWriteBuffer = (activeWriteBuffer == audioBufferA) ? audioBufferB : audioBufferA;
+        if (enqueueMicChunk(activeWriteBuffer, kChunkSamples * sizeof(int16_t), false)) {
+          int16_t* next = unusedMicBuffer();
+          if (next != nullptr) {
+            activeWriteBuffer = next;
+          }
           writeIndex = 0;
-
-          // Signal network task to transmit
-          xSemaphoreGive(xSendSemaphore);
         } else {
-          // Buffer overflow: Network task was too slow to send previous chunk
           Serial.printf("[Task] Buffer overflow! Drop chunk. (network busy: %s)\n",
                         netActivityName(netActivity));
           writeIndex = 0;
@@ -1235,32 +1560,37 @@ void networkTask(void* pvParameters) {
     const uint32_t waitMs = pttEndPending ? 50 : pollWaitMs;
     if (xSemaphoreTake(xSendSemaphore, pdMS_TO_TICKS(waitMs)) == pdTRUE) {
       if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[WiFi] Disconnected. Dropping chunk.");
-        activeSendBuffer = nullptr;
+        Serial.println("[WiFi] Disconnected. Retrying queued mic chunk.");
+        xSemaphoreGive(xSendSemaphore);
+        vTaskDelay(pdMS_TO_TICKS(200));
         continue;
       }
 
-      if (activeSendBuffer != nullptr) {
+      bool postFailed = false;
+      while (activeSendBuffer != nullptr) {
+        if (WiFi.status() != WL_CONNECTED) {
+          postFailed = true;
+          break;
+        }
         uint32_t postStart = millis();
         netActivity = kNetPost;
         HTTPClient http;
         http.setConnectTimeout(2000);
-        http.setTimeout(5000); // 5s read timeout
+        http.setTimeout(5000);
 
+        int httpCode = -1;
+        String response;
         if (http.begin(serverUrl)) {
           http.addHeader("Content-Type", "application/octet-stream");
 
-          int httpCode = http.POST(reinterpret_cast<uint8_t*>(const_cast<int16_t*>(activeSendBuffer)), sendBufferSize);
-          String response = http.getString();
+          httpCode = http.POST(reinterpret_cast<uint8_t*>(const_cast<int16_t*>(activeSendBuffer)), sendBufferSize);
+          response = http.getString();
           response.trim();
           http.end();
 
           uint32_t duration = millis() - postStart;
           lastHttpCode = httpCode;
           lastHttpDurationMs = duration;
-          if (httpCode > 0) {
-            postedChunks++;
-          }
           Serial.printf("[HTTP] POST chunk size=%d bytes -> Code=%d, Response=%s (took %d ms)\n",
                         sendBufferSize, httpCode, response.c_str(), duration);
         } else {
@@ -1268,16 +1598,43 @@ void networkTask(void* pvParameters) {
           Serial.println("[HTTP] Begin failed");
         }
 
-        // Release buffer lock
+        if (httpCode != 200) {
+          netActivity = kNetIdle;
+          Serial.println("[HTTP] POST failed; will retry queued chunk");
+          vTaskDelay(pdMS_TO_TICKS(200));
+          continue;
+        }
+
+        postedChunks++;
         activeSendBuffer = nullptr;
+        sendBufferSize = 0;
+        if (pendingSendBuffer != nullptr) {
+          activeSendBuffer = pendingSendBuffer;
+          sendBufferSize = pendingSendSize;
+          pendingSendBuffer = nullptr;
+          pendingSendSize = 0;
+        }
         netActivity = kNetIdle;
-        // A reply usually follows an upload: pick up thinking/speaking quickly.
-        pollWaitMs = kPollBusyMs;
+      }
+      if (postFailed) {
+        Serial.println("[WiFi] Disconnected during POST. Retrying queued mic chunk.");
+        xSemaphoreGive(xSendSemaphore);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        continue;
+      }
+      pollWaitMs = kPollBusyMs;
+      if (pttEndPending && WiFi.status() == WL_CONNECTED) {
+        if (postUtteranceEnd(utteranceEndUrl)) {
+          pttEndPending = false;
+        }
       }
     } else if (pttEndPending) {
-      pttEndPending = false;
-      if (WiFi.status() == WL_CONNECTED) {
-        postUtteranceEnd(utteranceEndUrl);
+      if (activeSendBuffer != nullptr || pendingSendBuffer != nullptr) {
+        // Tail is queued; wait for the POST path instead of ending early.
+      } else if (WiFi.status() == WL_CONNECTED) {
+        if (postUtteranceEnd(utteranceEndUrl)) {
+          pttEndPending = false;
+        }
         pollWaitMs = kPollBusyMs;
       }
     } else if (micActive) {
@@ -1338,16 +1695,19 @@ void setup() {
   Serial.printf("[WiFi] Connecting to SSID: %s ", WIFI_SSID);
 
   uint32_t startMs = millis();
+  size_t bootFaceFrame = 0;
   while (WiFi.status() != WL_CONNECTED && millis() - startMs < 30000) {
     delay(500);
     Serial.print('.');
+    drawEmotionFrame(ANIM_EMOTION_NEUTRAL, bootFaceFrame);
+    bootFaceFrame = (bootFaceFrame + 1) % ANIM_FRAMES_PER_EMOTION;
   }
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("[WiFi] Connected successfully!");
     printWifiStatus();
-    drawBootStatus("ESP32 STT Streamer", "WiFi: OK", WiFi.localIP().toString().c_str(), "Starting tasks...");
+    drawEmotionFrame(ANIM_EMOTION_POSITIVE, 0);
   } else {
     Serial.println("[WiFi] Warning: Failed to connect initially. Auto-reconnect will keep trying in background.");
     Serial.println("[WiFi] Scanning nearby 2.4GHz networks for diagnostics...");
@@ -1361,7 +1721,7 @@ void setup() {
     }
     WiFi.scanDelete();
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    drawBootStatus("ESP32 STT Streamer", "WiFi: WAIT", "Auto reconnect", "Starting tasks...");
+    drawEmotionFrame(ANIM_EMOTION_SAD, 0);
   }
 
   // 3. One shared I2S0 bus, then both onboard audio codecs.
@@ -1371,19 +1731,40 @@ void setup() {
     Serial.println("[Audio] Shared I2S0 TX/RX ready");
     speakerReady = setupAudioCodecs();
   }
-  Serial.printf("[Mic] ES7210 %s; PTT=K1/EXIO%d (hold to capture)\n",
-                micReady ? "ready" : "FAILED", EXIO_KEY1);
+  Serial.printf("[Mic] ES7210 %s; PTT=LCD touch (hold the screen to capture)\n",
+                micReady ? "ready" : "FAILED");
 
   // 4. ES8311 + onboard NS4150B amplifier. Failure is non-fatal for STT.
   if (speakerReady) {
-    Serial.printf("[Speaker] ES8311 ready: DOUT=%d PA=EXIO%d ('p'=REDRED, 'b'=beep)\n",
-                  PIN_I2S_DOUT, EXIO_PA_CTRL);
+    Serial.printf("[Speaker] ES8311 ready: volume=%d DOUT=%d PA=EXIO%d "
+                  "(K2=vol+, K3=vol-, 'p'=REDRED, 'b'=beep)\n",
+                  speakerVolume, PIN_I2S_DOUT, EXIO_PA_CTRL);
   } else {
     Serial.println("[Speaker] ES8311 setup FAILED (playback disabled)");
   }
 
-  // 5. Create semaphore and tasks
+  // 5. Create the mic-upload semaphore and 3-second speaker ring buffer.
   xSendSemaphore = xSemaphoreCreateBinary();
+  bool speakerRingInPsram = false;
+  speakerPcmStorage = static_cast<uint8_t*>(ps_malloc(kSpeakerRingBytes + 1));
+  if (speakerPcmStorage != nullptr) {
+    speakerRingInPsram = true;
+  } else {
+    // Keep playback available on boards where PSRAM failed to initialize.
+    speakerPcmStorage = static_cast<uint8_t*>(malloc(kSpeakerRingBytes + 1));
+  }
+  if (speakerPcmStorage != nullptr) {
+    speakerPcmStream = xStreamBufferCreateStatic(
+        kSpeakerRingBytes, 1, speakerPcmStorage, &speakerPcmStreamControl);
+  }
+  if (speakerPcmStream == nullptr) {
+    Serial.printf("[Speaker] Failed to allocate %u-byte ring buffer\n",
+                  static_cast<unsigned>(kSpeakerRingBytes));
+  } else {
+    Serial.printf("[Speaker] Ring buffer ready: %u bytes (3.0 s, %s)\n",
+                  static_cast<unsigned>(kSpeakerRingBytes),
+                  speakerRingInPsram ? "PSRAM" : "internal RAM");
+  }
 
   xTaskCreatePinnedToCore(
       displayTask,
@@ -1406,6 +1787,18 @@ void setup() {
       1
   );
 
+  // Playback is independent from HTTP reception. Core 1 keeps I2S writes close
+  // to the audio capture task, while the network task fills the ring on Core 0.
+  xTaskCreatePinnedToCore(
+      speakerPlaybackTask,
+      "SpeakerPlayback",
+      4096,
+      nullptr,
+      4,
+      nullptr,
+      1
+  );
+
   // Network IO runs on Core 0 (default Protocol core) with normal priority
   xTaskCreatePinnedToCore(
       networkTask,
@@ -1419,35 +1812,85 @@ void setup() {
 }
 
 void loop() {
-  // Push-to-talk: K1 is TCA9555 EXIO9, active LOW.
+  // Push-to-talk: any contact on the CST816D panel, not the physical K1 key.
   static bool lastPressed = false;
+  static bool bargeLatched = false;
   static uint32_t lastChangeMs = 0;
+  static uint32_t pressStartMs = 0;
+  constexpr uint32_t kMicPressMs = 50;
+  constexpr uint32_t kBargeInMs = 100;
 
-  bool pressed = ((exio.readAll() & (1u << EXIO_KEY1)) == 0);
+  bool pressed = touchReady && touch.touched();
   uint32_t now = millis();
 
-  if (pressed != lastPressed && (now - lastChangeMs) > 30) { // 30ms debounce
+  if (pressed != lastPressed && (now - lastChangeMs) > 30) {
     lastChangeMs = now;
     lastPressed = pressed;
-    micActive = pressed;
-    Serial.printf("[Button] Mic capture %s\n", pressed ? "ON" : "OFF");
-    if (pressed && (speakerDownlinkPlaying || serverRobotState == kUiThink || serverRobotState == kUiSpeak)) {
-      speakerBargeIn = true;
-      Serial.println("[Button] Barge-in: stop speaker");
+    if (pressed) {
+      pressStartMs = now;
+      bargeLatched = false;
+    } else {
+      if (micActive) {
+        Serial.println("[Touch] Mic capture OFF");
+      }
+      micActive = false;
+      bargeLatched = false;
     }
   }
 
+  // Ignore sub-50 ms contacts so CST816D ghost taps do not start a PTT turn.
+  if (pressed && lastPressed && !micActive && (now - pressStartMs) >= kMicPressMs) {
+    micActive = true;
+    Serial.println("[Touch] Mic capture ON");
+  }
+
+  // Ignore sub-100 ms contacts as barge-in so CST816D glitches do not stop TTS.
+  const bool speakingOrThinking =
+      speakerStreamOpen || speakerDownlinkPlaying ||
+      serverRobotState == kUiThink || serverRobotState == kUiSpeak;
+  if (pressed && lastPressed && speakingOrThinking && !bargeLatched &&
+      (now - pressStartMs) >= kBargeInMs) {
+    bargeLatched = true;
+    speakerBargeIn = true;
+    Serial.printf("[Touch] Barge-in: stop speaker (playing=%d open=%d ui=%d)\n",
+                  speakerDownlinkPlaying ? 1 : 0,
+                  speakerStreamOpen ? 1 : 0,
+                  serverRobotState);
+  }
+
+  static bool lastK2 = false;
+  static bool lastK3 = false;
+  static uint32_t lastVolumeKeyMs = 0;
+  const uint16_t exioBits = exio.readAll();
+  const bool k2Pressed = (exioBits & (1u << EXIO_KEY2)) == 0;
+  const bool k3Pressed = (exioBits & (1u << EXIO_KEY3)) == 0;
+  if (now - lastVolumeKeyMs > 30) {
+    if (k2Pressed && !lastK2) {
+      lastVolumeKeyMs = now;
+      applySpeakerVolume(speakerVolume + kSpeakerVolumeStep);
+    } else if (k3Pressed && !lastK3) {
+      lastVolumeKeyMs = now;
+      applySpeakerVolume(speakerVolume - kSpeakerVolumeStep);
+    }
+  }
+  lastK2 = k2Pressed;
+  lastK3 = k3Pressed;
+
   // Serial keyboard control:
-  //   'q' -> animation mode, 'w' -> status screen,
-  //   'p' -> REDRED beat, 'b' -> single test beep.
-  while (Serial.available() > 0) {
-    int c = Serial.read();
-    if (c == 'q' || c == 'Q') {
+  //   Ctrl+W (ASCII 0x17) -> toggle character/developer status screen,
+  //   'q' -> full emotion demo,
+  //   'p' -> REDRED beat (same key stops it), 'b' -> test beep (same key stops it).
+  while (pendingSerialChar >= 0 || Serial.available() > 0) {
+    int c = readSerialChar();
+    if (c == 0x17) {
+      diagnosticDisplayMode = !diagnosticDisplayMode;
+      animationMode = false;
+      Serial.printf("[Display] Ctrl+W -> %s\n",
+                    diagnosticDisplayMode ? "developer status" : "character UI");
+    } else if (c == 'q' || c == 'Q') {
+      diagnosticDisplayMode = false;
       animationMode = true;
       Serial.println("[Display] Animation mode ON (q)");
-    } else if (c == 'w' || c == 'W') {
-      animationMode = false;
-      Serial.println("[Display] Status screen ON (w)");
     } else if (c == 'p' || c == 'P') {
       playRedRedBeat();
     } else if (c == 'b' || c == 'B') {

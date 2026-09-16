@@ -1,0 +1,4 @@
+# Isolated Qwen3-ASR 0.6B sidecar for the production robot pipeline.
+# Python 3.11/3.12 on an Apple Silicon Mac is required.
+numpy>=1.24.0
+mlx-qwen3-asr==0.4.0

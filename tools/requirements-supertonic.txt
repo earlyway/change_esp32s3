@@ -1,0 +1,2 @@
+# Isolated A/B test dependency; do not add this to the STT server environment.
+supertonic==1.3.1

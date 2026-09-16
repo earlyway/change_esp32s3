@@ -82,19 +82,17 @@
 #define EXIO_CAM_SEL   6
 #define EXIO_USB_MUX   7
 #define EXIO_PA_CTRL   8   // speaker amp enable, HIGH = on
-#define EXIO_KEY1      9   // active LOW
-#define EXIO_KEY2      10  // active LOW
-#define EXIO_KEY3      11  // active LOW
+#define EXIO_KEY1      9   // physical K1; unused by the app
+#define EXIO_KEY2      10  // volume up, active LOW
+#define EXIO_KEY3      11  // volume down, active LOW
 
 // ---------------------------------------------------------------- Misc GPIO
-#define PIN_BUTTON_BOOT 0   // active LOW, usable as push-to-talk
+#define PIN_BUTTON_BOOT 0   // active LOW, firmware recovery only
 #define PIN_RGB_LED     38  // WS2812 x7
 #define PIN_SD_CLK      40
 #define PIN_SD_D0       41
 #define PIN_SD_CMD      42
 #define PIN_BAT_ADC     8
 
-// Push-to-talk button used by the app. BOOT is a plain GPIO so it needs no I2C.
-#ifndef PIN_BUTTON_MIC
-#define PIN_BUTTON_MIC PIN_BUTTON_BOOT
-#endif
+// Push-to-talk is the full LCD surface (CST816D). K1 is unused.
+// K2 raises speaker volume; K3 lowers it.

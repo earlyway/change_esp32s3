@@ -3,10 +3,11 @@
 
 Pipeline:
     ESP32 mic --POST /upload (1s PCM)--> this server --> rolling buffer
-        --> faster-whisper (sliding window + LocalAgreement) --> WebSocket /ws
+        --> Qwen3-ASR 0.6B sidecar (final PTT text) with faster-whisper
+            live preview + fallback --> WebSocket /ws
         --> local web page text input (tools/web/index.html)
 
-    Mac --POST /speaker/say (text)--> macOS say TTS --> /speaker/push queue
+    Mac --POST /speaker/say (text)--> selectable TTS --> /speaker/push queue
         --GET /speaker/pull--> ESP32 I2S speaker
 
     STT utterance end (or POST /robot/reply) --> LLM (Ollama qwen2.5:14b
@@ -22,6 +23,8 @@ Run:
 
 Environment variables:
     PORT          (default 3000)
+    STT_BACKEND   qwen (default) or faster-whisper
+    QWEN_STT_URL  local Qwen sidecar URL (default http://127.0.0.1:3002)
     STT_MODEL     faster-whisper model size (default "base")
     STT_DEVICE    "auto" | "cpu" | "cuda"   (default "auto")
     STT_COMPUTE   "auto" | "int8" | "float16" ... (default "auto")
@@ -29,10 +32,12 @@ Environment variables:
     STT_PROMPT    optional initial_prompt to bias domain vocabulary
     SAVE_RAW      "1" to also save received chunks to tools/uploads/*.raw
     SILENCE_RMS_DBFS  skip chunks quieter than this RMS dBFS (default -46)
-    END_SILENCE_S end utterance after this much silence (default 1.5)
+    END_SILENCE_S unused leftover (PTT ends via /utterance/end, not silence)
     SKIP_STT      "1" to skip loading faster-whisper (speaker downlink still works)
-    TTS_VOICE     macOS `say` voice (default: first ko_KR voice, usually Yuna)
-    TTS_RATE      speaking rate for `say` (default 180)
+    TTS_BACKEND   supertonic (default) or macos
+    SUPERTONIC_URL local sidecar URL (default http://127.0.0.1:3001)
+    TTS_VOICE     fallback macOS `say` voice (default: first ko_KR voice)
+    TTS_RATE      fallback speaking rate for `say` (default 180)
     LLM_BACKEND   ollama (default) or openai
     OLLAMA_MODEL  default qwen2.5:14b
     OPENAI_MODEL  default gpt-4o-mini (requires OPENAI_API_KEY)
@@ -43,8 +48,11 @@ Environment variables:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
+import urllib.error
+import urllib.request
 import warnings
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -64,8 +72,8 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 
 from stt_processor import StreamingTranscriber, TranscriptState
-from mac_tts import TtsError, default_korean_voice, synthesize_pcm
 from llm_backend import LlmError, backend_name, complete, model_name
+from tts_backend import TtsError, backend_name as tts_backend_name, synthesize_pcm
 
 HERE = Path(__file__).resolve().parent
 WEB_DIR = HERE / "web"
@@ -77,6 +85,9 @@ DEVICE = os.environ.get("STT_DEVICE", "auto")
 COMPUTE_TYPE = os.environ.get("STT_COMPUTE", "auto")
 LANGUAGE = os.environ.get("STT_LANGUAGE") or None
 INITIAL_PROMPT = os.environ.get("STT_PROMPT") or None
+STT_BACKEND = os.environ.get("STT_BACKEND", "qwen").strip().lower()
+QWEN_STT_URL = os.environ.get("QWEN_STT_URL", "http://127.0.0.1:3002").rstrip("/")
+MAX_UTTERANCE_BYTES = 16000 * 2 * 60
 SAVE_RAW = os.environ.get("SAVE_RAW", "0") == "1"
 SILENCE_RMS_DBFS = float(os.environ.get("SILENCE_RMS_DBFS", "-46"))
 END_SILENCE_S = float(os.environ.get("END_SILENCE_S", "1.5"))
@@ -87,7 +98,9 @@ AUDIO_CHUNK_S = 1.0
 SKIP_STT = os.environ.get("SKIP_STT", "0") == "1"
 ROBOT_AUTO_REPLY = os.environ.get("ROBOT_AUTO_REPLY", "1") == "1"
 SPEAKER_CHUNK_BYTES = 32000  # 1 s of 16 kHz / 16-bit / mono PCM
-SPEAKER_QUEUE_MAX = 32       # ~32 s of pending playback
+SPEAKER_QUEUE_MAX = 64       # ~64 s of pending playback
+# PTT release with no usable transcript still gets a short spoken retry prompt.
+EMPTY_UTTERANCE_REPLY = "잘 못 들었어. 다시 말해 줄래?"
 
 # `app` is created after the lifespan handlers below (see _lifespan).
 
@@ -100,6 +113,8 @@ class Hub:
         self.queue: Optional["asyncio.Queue[bytes]"] = None
         self.clients: Set[WebSocket] = set()
         self.last_state = TranscriptState(committed="", partial="")
+        self.transcript_history = ""
+        self.utterance_pcm = bytearray()
         self.worker_task: Optional[asyncio.Task] = None
         self.upload_count = 0
         self.silence_count = 0
@@ -122,6 +137,11 @@ class Hub:
         self.idle_task: Optional[asyncio.Task] = None
         # Guards transcriber use between the worker and utterance finalization.
         self.stt_lock = asyncio.Lock()
+        # Serializes LLM+TTS so two PTT turns cannot interleave speaker chunks.
+        self.reply_lock = asyncio.Lock()
+        # Debounces empty-PTT fallback so a retried /utterance/end after a real
+        # turn does not speak the canned prompt on top of the actual reply.
+        self.last_utterance_end_mono = 0.0
 
     async def broadcast(self, state: TranscriptState) -> None:
         self.last_state = state
@@ -142,6 +162,10 @@ hub = Hub()
 
 
 async def on_startup() -> None:
+    if STT_BACKEND not in ("qwen", "faster-whisper"):
+        raise RuntimeError(
+            f"Unsupported STT_BACKEND={STT_BACKEND!r}; use qwen or faster-whisper"
+        )
     if SAVE_RAW:
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -152,7 +176,8 @@ async def on_startup() -> None:
     if SKIP_STT:
         print("[STT] SKIP_STT=1: not loading faster-whisper. /upload will 503; /speaker/* works.")
     else:
-        print(f"[STT] Loading faster-whisper model '{MODEL_SIZE}' "
+        role = "fallback" if STT_BACKEND == "qwen" else "primary"
+        print(f"[STT] Loading faster-whisper {role} model '{MODEL_SIZE}' "
               f"(device={DEVICE}, compute={COMPUTE_TYPE})... this can take a while")
         loop = asyncio.get_running_loop()
         hub.transcriber = await loop.run_in_executor(
@@ -165,7 +190,9 @@ async def on_startup() -> None:
                 initial_prompt=INITIAL_PROMPT,
             ),
         )
-        print("[STT] Model ready.")
+        print(f"[STT] backend={STT_BACKEND} faster-whisper {role}=ready")
+        if STT_BACKEND == "qwen":
+            print(f"[STT] Qwen sidecar={QWEN_STT_URL} (final PTT text; Whisper fallback)")
         hub.worker_task = asyncio.create_task(_worker())
         hub.worker_task.add_done_callback(_worker_done)
         hub.idle_task = asyncio.create_task(_upload_idle_watch())
@@ -174,9 +201,9 @@ async def on_startup() -> None:
     print(f"[STT] PTT end marker: POST /utterance/end  (fallback: no uploads for {UPLOAD_IDLE_END_S:.0f}s)")
     print(f"[LLM] backend={backend_name()} model={model_name()} auto_reply={int(ROBOT_AUTO_REPLY)}")
     try:
-        print(f"[TTS] macOS say voice={default_korean_voice()!r}")
+        print(f"[TTS] backend={tts_backend_name()}")
     except TtsError as exc:
-        print(f"[TTS] unavailable: {exc}")
+        print(f"[TTS] configuration error: {exc}")
 
 
 async def on_shutdown() -> None:
@@ -224,20 +251,78 @@ def _drain_stt_queue() -> int:
     return drained
 
 
+def _append_utterance_pcm(pcm: bytes) -> None:
+    """Keep the current PTT take for the Qwen sidecar, capped at 60 seconds."""
+    hub.utterance_pcm.extend(pcm)
+    overflow = len(hub.utterance_pcm) - MAX_UTTERANCE_BYTES
+    if overflow > 0:
+        del hub.utterance_pcm[:overflow]
+
+
+def _join_transcript(prefix: str, turn: str) -> str:
+    prefix = prefix.strip()
+    turn = turn.strip()
+    if not prefix:
+        return turn
+    if not turn:
+        return prefix
+    return f"{prefix} {turn}"
+
+
+def _with_history(state: TranscriptState) -> TranscriptState:
+    """Render a current faster-whisper turn after finalized prior turns."""
+    return TranscriptState(
+        committed=_join_transcript(hub.transcript_history, state.committed),
+        partial=state.partial,
+        words=state.words,
+        window_seconds=state.window_seconds,
+        committed_delta=state.committed_delta,
+    )
+
+
 def _finalize_utterance() -> TranscriptState:
     """Last STT pass on buffered speech, then commit any leftover partial."""
     assert hub.transcriber is not None
     t = hub.transcriber
     state = t.process()
     flush_delta = t.flush_partial()
-    t.reset_audio_buffer()
-    return TranscriptState(
+    final = TranscriptState(
         committed=state.committed + flush_delta,
         partial="",
         words=state.words,
         window_seconds=state.window_seconds,
         committed_delta=(state.committed_delta or "") + flush_delta,
     )
+    # Each PTT press is a complete turn. History is owned by Hub so the
+    # fallback transcriber can safely start from a clean acoustic/text state.
+    t.reset()
+    return final
+
+
+class QwenSttError(RuntimeError):
+    pass
+
+
+def _qwen_transcribe_pcm(pcm: bytes) -> tuple[str, float]:
+    if not pcm:
+        raise QwenSttError("empty utterance PCM")
+    request = urllib.request.Request(
+        f"{QWEN_STT_URL}/transcribe",
+        data=pcm,
+        method="POST",
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise QwenSttError(f"Qwen service unavailable: {exc}") from exc
+    if not payload.get("ok"):
+        raise QwenSttError(str(payload.get("error") or "Qwen transcription failed"))
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise QwenSttError("Qwen returned an empty transcript")
+    return text, float(payload.get("seconds") or 0.0)
 
 
 async def _end_utterance(silence_seconds: float, reason: str = "silence") -> None:
@@ -255,19 +340,52 @@ async def _end_utterance(silence_seconds: float, reason: str = "silence") -> Non
         # Chunks still waiting in the queue (e.g. the PTT tail chunk) belong to
         # this utterance: feed them in before the final pass.
         _drain_stt_queue()
-        state = await loop.run_in_executor(None, _finalize_utterance)
+        utterance_pcm = bytes(hub.utterance_pcm)
+        hub.utterance_pcm.clear()
+        whisper_state = await loop.run_in_executor(None, _finalize_utterance)
+
+    turn = whisper_state.committed.strip()
+    selected_backend = "faster-whisper"
+    qwen_seconds = 0.0
+    if STT_BACKEND == "qwen":
+        try:
+            turn, qwen_seconds = await loop.run_in_executor(
+                None, lambda: _qwen_transcribe_pcm(utterance_pcm)
+            )
+            selected_backend = "qwen"
+        except QwenSttError as exc:
+            print(
+                f"[STT] Qwen failed; using faster-whisper fallback: {exc}",
+                flush=True,
+            )
+
+    hub.transcript_history = _join_transcript(hub.transcript_history, turn)
+    state = TranscriptState(
+        committed=hub.transcript_history,
+        partial="",
+        words=whisper_state.words,
+        window_seconds=len(utterance_pcm) / (16000 * 2),
+        committed_delta=turn,
+    )
     print(
         "[STT] end_utterance "
         f"reason={reason} silence={silence_seconds:.1f}s gen={gen} reset_audio=yes "
         f"stt_final={time.perf_counter() - t0:.2f}s "
+        f"backend={selected_backend} qwen={qwen_seconds:.3f}s "
         f"flush_delta={state.committed_delta!r} "
         f"committed_len={len(state.committed)}",
         flush=True,
     )
     await hub.broadcast(state)
-    turn = (state.committed_delta or "").strip()
+    hub.last_utterance_end_mono = time.monotonic()
     if ROBOT_AUTO_REPLY and turn:
         asyncio.create_task(_robot_auto_from_utterance(turn, t0))
+    elif ROBOT_AUTO_REPLY and reason == "ptt_release":
+        asyncio.create_task(
+            _robot_auto_from_utterance(
+                EMPTY_UTTERANCE_REPLY, t0, canned_reply=EMPTY_UTTERANCE_REPLY
+            )
+        )
 
 
 async def _upload_idle_watch() -> None:
@@ -359,14 +477,9 @@ async def upload(request: Request) -> PlainTextResponse:
 
         if is_silence:
             hub.silence_count += 1
-            silence_seconds = hub.silence_count * AUDIO_CHUNK_S
-            if (
-                hub.in_utterance
-                and silence_seconds >= END_SILENCE_S
-                and hub.transcriber is not None
-            ):
-                await _end_utterance(silence_seconds)
-            elif hub.silence_count >= 2 and hub.last_state.partial:
+            # PTT is edge-triggered by /utterance/end. Do not finalize while the
+            # user is still holding the screen; quiet 1 s chunks are just skipped.
+            if hub.silence_count >= 2 and hub.last_state.partial:
                 await hub.broadcast(
                     TranscriptState(committed=hub.last_state.committed, partial="")
                 )
@@ -376,10 +489,27 @@ async def upload(request: Request) -> PlainTextResponse:
 
         hub.silence_count = 0
         hub.in_utterance = True
+        _append_utterance_pcm(body)
         hub.queue.put_nowait(bytes(body))
         if SAVE_RAW:
             await asyncio.to_thread(_save_raw, body)
     return PlainTextResponse("upload_ok\n")
+
+
+def _maybe_empty_utterance_fallback() -> None:
+    """Speak the retry prompt when PTT ended with no usable speech."""
+    if not ROBOT_AUTO_REPLY:
+        return
+    now = time.monotonic()
+    if now - hub.last_utterance_end_mono < 1.0:
+        return
+    hub.last_utterance_end_mono = now
+    t0 = time.perf_counter()
+    asyncio.create_task(
+        _robot_auto_from_utterance(
+            EMPTY_UTTERANCE_REPLY, t0, canned_reply=EMPTY_UTTERANCE_REPLY
+        )
+    )
 
 
 @app.post("/utterance/end")
@@ -389,6 +519,7 @@ async def utterance_end() -> PlainTextResponse:
     if hub.transcriber is None:
         return PlainTextResponse("stt_not_ready\n", status_code=503)
     if not hub.in_utterance:
+        _maybe_empty_utterance_fallback()
         return PlainTextResponse("no_utterance\n")
     await _end_utterance(0.0, reason="ptt_release")
     return PlainTextResponse("utterance_ended\n")
@@ -431,7 +562,7 @@ async def speaker_push(request: Request):
 
 @app.post("/speaker/say")
 async def speaker_say(request: Request):
-    """TTS a sentence (macOS say) and queue it for the ESP32 speaker."""
+    """Synthesize a sentence with the selected TTS backend and queue it."""
     try:
         payload = await request.json()
     except Exception:
@@ -460,7 +591,7 @@ async def speaker_say(request: Request):
     hub.robot_busy = False
     stats = _pcm_stats(pcm)
     print(
-        "[TTS] say "
+        "[TTS] manual "
         f"text={text!r} "
         f"bytes={len(pcm)} "
         f"chunks={result['chunks']} "
@@ -485,14 +616,38 @@ class ReplyCancelled(Exception):
     """Barge-in flushed the speaker while this reply was still being produced."""
 
 
-async def _robot_auto_from_utterance(turn: str, t_stt_end: float) -> None:
+async def _robot_auto_from_utterance(
+    turn: str,
+    t_stt_end: float,
+    canned_reply: Optional[str] = None,
+) -> None:
+    # Drop any unplayed previous reply so two turns cannot share the speaker queue.
+    _flush_speaker_queue()
+    my_gen = hub.reply_generation
     try:
-        await _robot_respond(turn, speak=True, source="utterance", t_stt_end=t_stt_end)
+        async with hub.reply_lock:
+            if my_gen != hub.reply_generation:
+                return
+            if canned_reply:
+                hub.robot_busy = True
+                try:
+                    spoken = await _speak_robot_reply(canned_reply, "sad", gen=my_gen)
+                finally:
+                    if my_gen == hub.reply_generation:
+                        hub.robot_busy = False
+                print(
+                    f"[TTS] empty-utterance fallback bytes={spoken.get('bytes')} "
+                    f"gen={my_gen}",
+                    flush=True,
+                )
+                return
+            await _robot_respond(turn, speak=True, source="utterance", t_stt_end=t_stt_end)
     except ReplyCancelled:
         pass
     except Exception as exc:
         print(f"[LLM] auto_reply failed: {exc}", flush=True)
-        hub.robot_busy = False
+        if my_gen == hub.reply_generation:
+            hub.robot_busy = False
 
 
 async def _speak_robot_reply(text: str, emotion: str, gen: Optional[int] = None) -> dict:
@@ -618,7 +773,8 @@ async def robot_reply(request: Request):
     if not text:
         return JSONResponse({"ok": False, "error": "empty text"}, status_code=400)
     try:
-        return JSONResponse(await _robot_respond(text, bool(speak), source="api"))
+        async with hub.reply_lock:
+            return JSONResponse(await _robot_respond(text, bool(speak), source="api"))
     except ReplyCancelled:
         return JSONResponse({"ok": False, "error": "cancelled_by_barge_in"}, status_code=409)
     except LlmError as exc:
@@ -636,6 +792,9 @@ async def robot_status():
         {
             "backend": backend_name(),
             "model": model_name(),
+            "stt_backend": STT_BACKEND,
+            "qwen_stt_url": QWEN_STT_URL,
+            "tts_backend": tts_backend_name(),
             "auto_reply": ROBOT_AUTO_REPLY,
             "robot_state": _robot_state(),
             "last": hub.last_robot or None,
@@ -742,8 +901,10 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 print(f"[STT] full_reset gen={gen}", flush=True)
                 hub.in_utterance = False
                 hub.silence_count = 0
+                hub.transcript_history = ""
                 async with hub.stt_lock:
                     _drain_stt_queue()
+                    hub.utterance_pcm.clear()
                     hub.transcriber.reset()
                 await hub.broadcast(TranscriptState(committed="", partial=""))
     except WebSocketDisconnect:
@@ -758,18 +919,22 @@ def _enqueue_speaker_pcm(pcm: bytes, emotion: str) -> dict:
     chunks = _split_speaker_chunks(pcm)
     queued = 0
     dropped = 0
+    truncated = 0
     for chunk in chunks:
         if hub.speaker_queue.full():
-            try:
-                hub.speaker_queue.get_nowait()
-                dropped += 1
-            except asyncio.QueueEmpty:
-                pass
+            truncated = len(chunks) - queued
+            print(
+                f"[SPEAKER] queue full; keeping already-queued start, "
+                f"dropping {truncated} later chunk(s)",
+                flush=True,
+            )
+            break
         hub.speaker_queue.put_nowait((chunk, emotion))
         queued += 1
     return {
         "chunks": queued,
         "dropped_old": dropped,
+        "truncated": truncated,
         "queue": hub.speaker_queue.qsize(),
     }
 
@@ -810,9 +975,6 @@ def _pcm_from_wav(body: bytes) -> bytes:
 
 def _split_speaker_chunks(pcm: bytes) -> list[bytes]:
     return [pcm[i:i + SPEAKER_CHUNK_BYTES] for i in range(0, len(pcm), SPEAKER_CHUNK_BYTES)]
-    when = datetime.now(timezone.utc).isoformat().replace(":", "-").replace(".", "-")
-    path = UPLOAD_DIR / f"chunk_{when}_{len(body)}.raw"
-    path.write_bytes(body)
 
 
 def _pcm_stats(body: bytes) -> dict[str, float]:
