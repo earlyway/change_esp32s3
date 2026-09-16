@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""macOS TTS → 16 kHz / 16-bit / mono PCM (robot pipeline format).
+"""macOS TTS → 44.1 kHz / 16-bit / mono PCM for Mac speaker playback.
 
 Uses the built-in `say` command and `afconvert`. No extra pip packages.
 Override the voice with TTS_VOICE (default: first ko_KR voice, usually Yuna).
@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-SAMPLE_RATE = 16000
+SAMPLE_RATE = 44100
 
 
 class TtsError(RuntimeError):
@@ -41,7 +41,7 @@ def default_korean_voice() -> str:
 
 
 def synthesize_pcm(text: str, voice: str | None = None, rate: int | None = None) -> bytes:
-    """Return headerless little-endian int16 mono PCM at 16 kHz."""
+    """Return headerless little-endian int16 mono PCM at 44.1 kHz."""
     cleaned = " ".join((text or "").split())
     if not cleaned:
         raise TtsError("empty text")
@@ -73,7 +73,7 @@ def synthesize_pcm(text: str, voice: str | None = None, rate: int | None = None)
                 [
                     "afconvert",
                     "-f", "WAVE",
-                    "-d", "LEI16@16000",
+                    "-d", f"LEI16@{SAMPLE_RATE}",
                     "-c", "1",
                     str(aiff_path),
                     str(wav_path),

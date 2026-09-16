@@ -3,7 +3,7 @@
 
     python3 tools/robot_reply.py 오늘 날씨 정말 좋다
 
-Requires tools/stt_server.py running. Default LLM is Ollama qwen2.5:14b.
+Requires tools/stt_server.py running. Default LLM is Ollama qwen3:30b-a3b.
 """
 
 from __future__ import annotations

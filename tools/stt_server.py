@@ -10,7 +10,7 @@ Pipeline:
     Mac --POST /speaker/say (text)--> selectable TTS --> Mac speaker (afplay)
         ESP32 --GET /speaker/pull--> X-Robot-State / X-Emotion only (face sync)
 
-    STT utterance end (or POST /robot/reply) --> LLM (Ollama qwen2.5:14b
+    STT utterance end (or POST /robot/reply) --> LLM (Ollama qwen3:30b-a3b
         or OpenAI gpt-4o-mini) --> TTS --> Mac speaker
 
 The board's speaker wiring is gone, so all TTS audio plays on the Mac. The
@@ -40,9 +40,11 @@ Environment variables:
     TTS_VOICE     fallback macOS `say` voice (default: first ko_KR voice)
     TTS_RATE      fallback speaking rate for `say` (default 180)
     LLM_BACKEND   ollama (default) or openai
-    OLLAMA_MODEL  default qwen2.5:14b
+    OLLAMA_MODEL  default qwen3:30b-a3b (think off, keep_alive 30m)
     OPENAI_MODEL  default gpt-4o-mini (requires OPENAI_API_KEY)
     ROBOT_AUTO_REPLY  "1" (default) to LLM+TTS after each STT utterance end
+    LLM_HISTORY_TURNS recent user+assistant pairs sent in full (default 8)
+    LLM_HISTORY_IDLE_S unused leftover (memory is persistent; 0 = never expire)
     Optional file tools/llm.env (gitignored) sets the same keys if unset.
 """
 
@@ -78,7 +80,8 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Res
 
 from stt_processor import StreamingTranscriber, TranscriptState
 from llm_backend import LlmError, backend_name, complete, model_name
-from tts_backend import TtsError, backend_name as tts_backend_name, synthesize_pcm
+from tts_backend import TtsError, backend_name as tts_backend_name, synthesize
+from chat_memory import ChatStore
 
 HERE = Path(__file__).resolve().parent
 WEB_DIR = HERE / "web"
@@ -102,7 +105,11 @@ UPLOAD_IDLE_END_S = float(os.environ.get("UPLOAD_IDLE_END_S", "3.0"))
 AUDIO_CHUNK_S = 1.0
 SKIP_STT = os.environ.get("SKIP_STT", "0") == "1"
 ROBOT_AUTO_REPLY = os.environ.get("ROBOT_AUTO_REPLY", "1") == "1"
-SPEAKER_BYTES_PER_SECOND = 32000  # 16 kHz / 16-bit / mono PCM
+# Newest N turns go into the LLM messages list. Older turns are archived to
+# disk (.robot-runtime/chat_memory.json) and sent as long-term notes.
+CHAT_HISTORY_MAX_TURNS = max(1, int(os.environ.get("LLM_HISTORY_TURNS", "8")))
+# 0 = keep memory across idle time and process restarts (the default).
+CHAT_HISTORY_IDLE_S = float(os.environ.get("LLM_HISTORY_IDLE_S", "0"))
 # TTS plays on the Mac speaker (the board's speaker wiring is gone). 0.0–1.0
 # maps to `afplay -v`; values above 1.0 amplify.
 TTS_VOLUME = float(os.environ.get("TTS_VOLUME", "1.0"))
@@ -111,8 +118,9 @@ EMPTY_UTTERANCE_REPLY = "잘 못 들었어. 다시 말해 줄래?"
 
 
 class MacPlayer:
-    """Plays 16 kHz mono PCM through the Mac speaker with `afplay`.
+    """Plays 16-bit mono PCM through the Mac speaker with `afplay`.
 
+    Sample rate follows the TTS clip (44.1 kHz for Supertonic/macOS say).
     One utterance at a time: starting a new one stops the previous. The ESP32
     still polls /speaker/pull, but only for X-Robot-State / X-Emotion so the
     face can follow the reply; no audio goes back to the board.
@@ -149,16 +157,19 @@ class MacPlayer:
         left = self.duration_s - (time.monotonic() - self.started_mono)
         return max(0, int(left * 1000))
 
-    def play(self, pcm: bytes, emotion: str) -> dict:
+    def play(self, pcm: bytes, emotion: str, sample_rate: int = 44100) -> dict:
         if self.afplay is None:
             raise RuntimeError("afplay_not_found (macOS required for Mac speaker output)")
+        rate = int(sample_rate) if sample_rate else 44100
+        if rate < 8000:
+            rate = 44100
         self.stop()
         fd, path = tempfile.mkstemp(prefix="mallow_tts_", suffix=".wav")
         os.close(fd)
         with wave.open(path, "wb") as wav:
             wav.setnchannels(1)
             wav.setsampwidth(2)
-            wav.setframerate(16000)
+            wav.setframerate(rate)
             wav.writeframes(pcm)
         self.proc = subprocess.Popen(
             [self.afplay, "-v", f"{TTS_VOLUME:.2f}", path],
@@ -168,9 +179,9 @@ class MacPlayer:
         self.path = path
         self.emotion = emotion
         self.started_mono = time.monotonic()
-        self.duration_s = len(pcm) / SPEAKER_BYTES_PER_SECOND
+        self.duration_s = len(pcm) / (rate * 2)
         self.play_count += 1
-        return {"seconds": round(self.duration_s, 2), "emotion": emotion}
+        return {"seconds": round(self.duration_s, 2), "emotion": emotion, "sample_rate": rate}
 
     def stop(self) -> bool:
         was_playing = self.proc is not None and self.proc.poll() is None
@@ -232,6 +243,9 @@ class Hub:
         # Debounces empty-PTT fallback so a retried /utterance/end after a real
         # turn does not speak the canned prompt on top of the actual reply.
         self.last_utterance_end_mono = 0.0
+        # Recent LLM turns live in ChatStore (disk). RAM mirror is for logging.
+        self.chat_store = ChatStore()
+        self.chat_last_turn_mono = 0.0
 
     async def broadcast(self, state: TranscriptState) -> None:
         self.last_state = state
@@ -263,6 +277,13 @@ async def on_startup() -> None:
     hub.queue = asyncio.Queue()
     if hub.player.afplay is None:
         print("[Speaker] WARNING: afplay not found; TTS playback disabled", flush=True)
+    hub.chat_store.load()
+    if hub.chat_store.turn_count or hub.chat_store.notes:
+        print(
+            f"[LLM] restored chat memory turns={hub.chat_store.turn_count} "
+            f"notes_chars={len(hub.chat_store.notes)} path={hub.chat_store.path}",
+            flush=True,
+        )
 
     if SKIP_STT:
         print("[STT] SKIP_STT=1: not loading faster-whisper. /upload will 503; /speaker/* works.")
@@ -291,7 +312,13 @@ async def on_startup() -> None:
     print(f"[Speaker] Mac speaker output (afplay, volume={TTS_VOLUME:.2f}): "
           "POST /speaker/say  POST /speaker/push  POST /speaker/flush  GET /speaker/pull (state only)")
     print(f"[STT] PTT end marker: POST /utterance/end  (fallback: no uploads for {UPLOAD_IDLE_END_S:.0f}s)")
-    print(f"[LLM] backend={backend_name()} model={model_name()} auto_reply={int(ROBOT_AUTO_REPLY)}")
+    print(
+        f"[LLM] backend={backend_name()} model={model_name()} "
+        f"auto_reply={int(ROBOT_AUTO_REPLY)} "
+        f"history_turns={CHAT_HISTORY_MAX_TURNS} "
+        f"history_idle_s={CHAT_HISTORY_IDLE_S:.0f} "
+        f"memory_file={hub.chat_store.path}"
+    )
     try:
         print(f"[TTS] backend={tts_backend_name()}")
     except TtsError as exc:
@@ -304,6 +331,10 @@ async def on_shutdown() -> None:
     if hub.idle_task:
         hub.idle_task.cancel()
     hub.player.stop()
+    try:
+        hub.chat_store.save()
+    except OSError as exc:
+        print(f"[LLM] chat memory save failed on shutdown: {exc}", flush=True)
 
 
 @asynccontextmanager
@@ -627,14 +658,14 @@ async def ping(request: Request) -> PlainTextResponse:
 
 @app.post("/speaker/push")
 async def speaker_push(request: Request):
-    """Play 16 kHz / 16-bit / mono PCM (or a WAV wrapping that format) on the Mac speaker."""
+    """Play 16-bit mono PCM (or a WAV wrapping that format) on the Mac speaker."""
     body = await request.body()
     emotion = (request.headers.get("x-emotion") or "none").strip() or "none"
-    pcm = _pcm_from_body(body)
+    pcm, sample_rate = _audio_from_body(body)
     if len(pcm) < 2:
         return PlainTextResponse("empty_pcm\n", status_code=400)
     try:
-        result = _play_on_mac(pcm, emotion)
+        result = _play_on_mac(pcm, emotion, sample_rate)
     except RuntimeError as exc:
         return PlainTextResponse(str(exc) + "\n", status_code=503)
     hub.speaker_push_count += 1
@@ -666,31 +697,32 @@ async def speaker_say(request: Request):
     loop = asyncio.get_running_loop()
     hub.robot_busy = True
     try:
-        pcm = await loop.run_in_executor(None, lambda: synthesize_pcm(text))
+        clip = await loop.run_in_executor(None, lambda: synthesize(text))
     except TtsError as exc:
         hub.robot_busy = False
         print(f"[TTS] failed: {exc}", flush=True)
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
     try:
-        result = _play_on_mac(pcm, emotion)
+        result = _play_on_mac(clip.pcm, emotion, clip.sample_rate)
     except RuntimeError as exc:
         hub.robot_busy = False
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
 
     hub.speaker_push_count += 1
     hub.robot_busy = False
-    stats = _pcm_stats(pcm)
+    stats = _pcm_stats(clip.pcm)
     print(
         "[TTS] manual "
         f"text={text!r} "
-        f"bytes={len(pcm)} "
+        f"bytes={len(clip.pcm)} "
+        f"rate={clip.sample_rate} "
         f"seconds={result['seconds']} "
         f"emotion={emotion!r} "
         f"rms={stats['rms_dbfs']:.1f}dBFS",
         flush=True,
     )
-    return JSONResponse({"ok": True, "text": text, "bytes": len(pcm), **result})
+    return JSONResponse({"ok": True, "text": text, "bytes": len(clip.pcm), **result})
 
 
 class ReplyCancelled(Exception):
@@ -733,28 +765,65 @@ async def _robot_auto_from_utterance(
 
 async def _speak_robot_reply(text: str, emotion: str, gen: Optional[int] = None) -> dict:
     loop = asyncio.get_running_loop()
-    pcm = await loop.run_in_executor(None, lambda: synthesize_pcm(text))
+    clip = await loop.run_in_executor(None, lambda: synthesize(text))
     if gen is not None and gen != hub.reply_generation:
         raise ReplyCancelled("barge-in during TTS")
     t_q0 = time.perf_counter()
-    result = _play_on_mac(pcm, emotion)
+    result = _play_on_mac(clip.pcm, emotion, clip.sample_rate)
     queue_s = time.perf_counter() - t_q0
     hub.speaker_push_count += 1
-    stats = _pcm_stats(pcm)
+    stats = _pcm_stats(clip.pcm)
     print(
         "[TTS] robot "
         f"text={text!r} "
-        f"bytes={len(pcm)} "
+        f"bytes={len(clip.pcm)} "
+        f"rate={clip.sample_rate} "
         f"seconds={result['seconds']} "
         f"emotion={emotion!r} "
         f"rms={stats['rms_dbfs']:.1f}dBFS",
         flush=True,
     )
     return {
-        "bytes": len(pcm),
+        "bytes": len(clip.pcm),
         "play_start_s": round(queue_s, 3),
         **result,
     }
+
+
+def _chat_turn_count() -> int:
+    return hub.chat_store.turn_count
+
+
+def _clear_chat_history(reason: str) -> None:
+    turns = _chat_turn_count()
+    hub.chat_store.clear()
+    hub.chat_last_turn_mono = 0.0
+    if turns:
+        print(f"[LLM] chat history cleared reason={reason} dropped_turns={turns}", flush=True)
+
+
+def _expire_idle_chat_history() -> None:
+    if CHAT_HISTORY_IDLE_S <= 0:
+        return
+    if not hub.chat_store.turns or hub.chat_last_turn_mono <= 0:
+        return
+    idle_s = time.monotonic() - hub.chat_last_turn_mono
+    if idle_s >= CHAT_HISTORY_IDLE_S:
+        _clear_chat_history(f"idle_{idle_s:.0f}s")
+
+
+def _chat_history_for_llm() -> tuple[list[dict[str, str]], str]:
+    _expire_idle_chat_history()
+    return hub.chat_store.recent_messages(CHAT_HISTORY_MAX_TURNS), hub.chat_store.notes
+
+
+def _append_chat_turn(user_text: str, reply: str) -> None:
+    hub.chat_store.append(user_text, reply, CHAT_HISTORY_MAX_TURNS)
+    hub.chat_last_turn_mono = time.monotonic()
+    try:
+        hub.chat_store.save()
+    except OSError as exc:
+        print(f"[LLM] chat memory save failed: {exc}", flush=True)
 
 
 async def _robot_respond(
@@ -768,8 +837,11 @@ async def _robot_respond(
     gen = hub.reply_generation
     hub.robot_busy = True
     t_llm0 = time.perf_counter()
+    history, memory_notes = _chat_history_for_llm()
     try:
-        llm = await loop.run_in_executor(None, lambda: complete(user_text))
+        llm = await loop.run_in_executor(
+            None, lambda: complete(user_text, history, memory_notes)
+        )
     except Exception:
         if gen == hub.reply_generation:
             hub.robot_busy = False
@@ -781,6 +853,8 @@ async def _robot_respond(
     print(
         f"[LLM] {llm.backend}/{llm.model} "
         f"{llm.elapsed_s:.2f}s source={source} "
+        f"history={len(history) // 2}turns "
+        f"notes={len(memory_notes)}c "
         f"emotion={llm.emotion} "
         f"user={user_text!r} "
         f"reply={llm.reply!r}",
@@ -805,6 +879,7 @@ async def _robot_respond(
             raise
     if gen == hub.reply_generation:
         hub.robot_busy = False
+        _append_chat_turn(user_text, llm.reply)
     print(
         "[TIMING] "
         f"stt_end_to_llm={t_llm0 - t0:.2f}s "
@@ -832,6 +907,7 @@ async def _robot_respond(
         "elapsed_s": round(llm.elapsed_s, 2),
         "user_text": user_text,
         "source": source,
+        "chat_turns": _chat_turn_count(),
         "spoken": spoken,
     }
     return out
@@ -875,6 +951,8 @@ async def robot_status():
             "tts_backend": tts_backend_name(),
             "auto_reply": ROBOT_AUTO_REPLY,
             "robot_state": _robot_state(),
+            "chat_turns": _chat_turn_count(),
+            "chat_notes_chars": len(hub.chat_store.notes),
             "last": hub.last_robot or None,
         }
     )
@@ -940,7 +1018,11 @@ async def speaker_status():
 
 @app.get("/")
 async def index() -> FileResponse:
-    return FileResponse(WEB_DIR / "index.html")
+    # Local dev page: never let the browser keep a stale copy after edits.
+    return FileResponse(
+        WEB_DIR / "index.html",
+        headers={"Cache-Control": "no-store, must-revalidate"},
+    )
 
 
 @app.websocket("/ws")
@@ -955,16 +1037,18 @@ async def ws_endpoint(ws: WebSocket) -> None:
     try:
         while True:
             msg = await ws.receive_text()
-            if msg == "reset" and hub.transcriber is not None:
+            if msg == "reset":
                 gen = _bump_utterance_generation()
                 print(f"[STT] full_reset gen={gen}", flush=True)
                 hub.in_utterance = False
                 hub.silence_count = 0
                 hub.transcript_history = ""
+                _clear_chat_history("ws_reset")
                 async with hub.stt_lock:
-                    _drain_stt_queue()
                     hub.utterance_pcm.clear()
-                    hub.transcriber.reset()
+                    if hub.transcriber is not None and hub.queue is not None:
+                        _drain_stt_queue()
+                        hub.transcriber.reset()
                 await hub.broadcast(TranscriptState(committed="", partial=""))
     except WebSocketDisconnect:
         pass
@@ -972,9 +1056,9 @@ async def ws_endpoint(ws: WebSocket) -> None:
         hub.clients.discard(ws)
 
 
-def _play_on_mac(pcm: bytes, emotion: str) -> dict:
+def _play_on_mac(pcm: bytes, emotion: str, sample_rate: int = 44100) -> dict:
     """Play one utterance on the Mac speaker (stops whatever was playing)."""
-    return hub.player.play(pcm, emotion)
+    return hub.player.play(pcm, emotion, sample_rate)
 
 
 def _save_raw(body: bytes) -> None:
@@ -983,18 +1067,19 @@ def _save_raw(body: bytes) -> None:
     path.write_bytes(body)
 
 
-def _pcm_from_body(body: bytes) -> bytes:
-    """Accept headerless PCM or a 16-bit WAV; return raw little-endian int16 samples."""
+def _audio_from_body(body: bytes) -> tuple[bytes, int]:
+    """Accept headerless PCM (assumed 16 kHz) or a 16-bit WAV."""
     if len(body) >= 12 and body[:4] == b"RIFF" and body[8:12] == b"WAVE":
         return _pcm_from_wav(body)
     if len(body) % 2 == 1:
         body = body[:-1]
-    return body
+    return body, 16000
 
 
-def _pcm_from_wav(body: bytes) -> bytes:
+def _pcm_from_wav(body: bytes) -> tuple[bytes, int]:
     pos = 12
     data = b""
+    sample_rate = 16000
     while pos + 8 <= len(body):
         chunk_id = body[pos:pos + 4]
         chunk_len = int.from_bytes(body[pos + 4:pos + 8], "little")
@@ -1003,12 +1088,14 @@ def _pcm_from_wav(body: bytes) -> bytes:
         pos += chunk_len
         if chunk_len % 2 == 1:
             pos += 1
-        if chunk_id == b"data":
+        if chunk_id == b"fmt " and len(payload) >= 16:
+            sample_rate = int.from_bytes(payload[4:8], "little") or 16000
+        elif chunk_id == b"data":
             data = payload
             break
     if len(data) % 2 == 1:
         data = data[:-1]
-    return data
+    return data, sample_rate
 
 
 def _pcm_stats(body: bytes) -> dict[str, float]:

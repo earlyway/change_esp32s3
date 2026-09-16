@@ -102,9 +102,8 @@
       margin-bottom: 8px;
     }
     .speak-row { display: flex; gap: 8px; flex-wrap: wrap; }
-    .speak-row input {
-      flex: 1;
-      min-width: 180px;
+    .speak-row input,
+    .speak-row select {
       background: var(--bg);
       color: var(--text);
       border: 1px solid var(--border);
@@ -112,6 +111,7 @@
       padding: 9px 12px;
       font-size: 15px;
     }
+    .speak-row input { flex: 1; min-width: 180px; }
     .speak-status { margin-top: 8px; font-size: 12px; color: var(--muted); min-height: 1.4em; }
     .robot-reply {
       margin-top: 10px;
@@ -141,13 +141,21 @@
     <div class="toolbar">
       <button class="primary" id="copyBtn">복사</button>
       <button id="clearBtn">입력창 비우기</button>
-      <button id="resetBtn">전사 초기화 (서버)</button>
+      <button id="resetBtn">전사·대화 초기화 (서버)</button>
     </div>
 
     <div class="speak-box">
-      <label for="speakText">ESP32 스피커로 말하기 (Phase 2 TTS)</label>
+      <label for="speakText">맥 스피커로 말하기 (TTS · 표정 테스트)</label>
       <div class="speak-row">
         <input id="speakText" type="text" maxlength="500" placeholder="문장을 입력하거나, 위 STT 텍스트를 말한 뒤 버튼을 누르세요" />
+        <select id="speakEmotion" aria-label="표정">
+          <option value="none">표정: 기본</option>
+          <option value="positive">positive</option>
+          <option value="neutral">neutral</option>
+          <option value="sad">sad</option>
+          <option value="angry">angry</option>
+          <option value="surprised">surprised</option>
+        </select>
         <button class="primary" id="speakBtn">말하기</button>
       </div>
       <div class="speak-status" id="speakStatus"></div>
@@ -168,7 +176,7 @@
       확정 텍스트(흰색)는 클릭 후 키보드로 직접 수정할 수 있습니다. 편집 중에는 서버 확정문만 덮어쓰지 않고, 회색 partial은 계속 갱신됩니다.
       <br />ESP32가 <code>/upload</code> 로 1초 단위 PCM 청크를 내면 자동으로 인식됩니다.
       <br /><strong>말하기</strong>는 TTS(Supertonic, 실패 시 <code>say</code>)로 음성을 만들어 <strong>맥 스피커</strong>에서 재생합니다. ESP32는 <code>/speaker/pull</code>로 상태·감정만 받아 표정을 맞춥니다.
-      <br /><strong>물어보기</strong>는 기본 Ollama qwen2.5:14b, 전환은 <code>LLM_BACKEND=openai</code> + <code>OPENAI_API_KEY</code>. 발화 종료 시 자동 답변(<code>ROBOT_AUTO_REPLY=1</code>).
+      <br /><strong>물어보기</strong>는 기본 Ollama qwen3:30b-a3b, 전환은 <code>LLM_BACKEND=openai</code> + <code>OPENAI_API_KEY</code>. 발화 종료 시 자동 답변(<code>ROBOT_AUTO_REPLY=1</code>). 최근 8턴은 그대로, 그 이전은 디스크에 쌓여 서버를 껐다 켜도 이어집니다. 웹의 초기화 버튼을 누르면 그 기억도 지워집니다.
     </p>
   </div>
 
@@ -323,6 +331,7 @@
     const speakInput = document.getElementById("speakText");
     const speakStatus = document.getElementById("speakStatus");
     const speakBtn = document.getElementById("speakBtn");
+    const speakEmotion = document.getElementById("speakEmotion");
 
     async function speakText() {
       const typed = speakInput.value.trim();
@@ -338,13 +347,13 @@
         const resp = await fetch("/speaker/say", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text, emotion: "none" }),
+          body: JSON.stringify({ text, emotion: speakEmotion.value }),
         });
         const data = await resp.json();
         if (!resp.ok || !data.ok) {
           speakStatus.textContent = "실패: " + (data.error || resp.status);
         } else {
-          speakStatus.textContent = `큐에 넣음 (${data.seconds}s, ${data.chunks}청크). ESP32 시리얼에 pull 로그가 뜨면 수신된 것입니다.`;
+          speakStatus.textContent = `맥 스피커 재생 시작 (${data.seconds}s, 표정 ${data.emotion}). 보드 표정이 바뀌면 동기화 정상입니다.`;
         }
       } catch (err) {
         speakStatus.textContent = "요청 실패: " + err;

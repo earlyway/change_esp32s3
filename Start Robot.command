@@ -118,6 +118,30 @@ ensure_ollama() {
   echo "[WARN] Ollama did not become ready. The launcher will continue with STT/TTS only."
 }
 
+# The LLM model is not pulled automatically (qwen3:30b-a3b is ~18 GB); only warn.
+check_ollama_model() {
+  local model="${OLLAMA_MODEL:-}"
+  if [[ -z "$model" && -f "$PROJECT_DIR/tools/llm.env" ]]; then
+    model="$(sed -n 's/^[[:space:]]*OLLAMA_MODEL=[[:space:]]*//p' "$PROJECT_DIR/tools/llm.env" | tail -n 1 | tr -d '"'"'" )"
+  fi
+  [[ -n "$model" ]] || model="qwen3:30b-a3b"
+
+  local tags
+  tags="$(curl -fsS --max-time 2 http://127.0.0.1:11434/api/tags 2>/dev/null)" || return
+  if printf '%s' "$tags" | python3 -c '
+import json, sys
+want = sys.argv[1]
+names = {m.get("name", "") for m in json.load(sys.stdin).get("models", [])}
+ok = want in names or (":" not in want and f"{want}:latest" in names)
+raise SystemExit(0 if ok else 1)
+' "$model"; then
+    echo "[Ollama] Model ready: $model"
+  else
+    echo "[WARN] Ollama model '$model' is not installed. Automatic replies will fail until you run:"
+    echo "       ollama pull $model"
+  fi
+}
+
 supertonic_ready() {
   curl -fsS --max-time 2 "$SUPERTONIC_URL/health" 2>/dev/null \
     | python3 -c 'import json,sys; data=json.load(sys.stdin); raise SystemExit(data.get("service") != "supertonic-robot-tts")' \
@@ -170,7 +194,7 @@ ensure_supertonic() {
   nohup env \
     SUPERTONIC_RUNTIME_DIR="$RUNTIME_DIR/supertonic" \
     SUPERTONIC_VOICE=F1 \
-    SUPERTONIC_STEPS=8 \
+    SUPERTONIC_STEPS=32 \
     SUPERTONIC_SPEED=1.0 \
     "$SUPERTONIC_VENV/bin/python" -u "$PROJECT_DIR/tools/supertonic_tts_service.py" \
     >"$SUPERTONIC_LOG" 2>&1 &
@@ -353,6 +377,7 @@ echo "[Board] Firmware ready."
 
 ensure_python_deps
 ensure_ollama
+check_ollama_model
 ensure_supertonic
 ensure_qwen_stt
 start_stt_server
@@ -362,6 +387,7 @@ open "$WEB_URL"
 
 echo
 echo "READY: Hold the LCD, speak, then lift your finger."
+echo "Replies play through the Mac speaker (board speaker unused); adjust loudness with the Mac volume or TTS_VOLUME."
 echo "The server continues running after this window closes."
 echo "Server log: $SERVER_LOG"
 echo

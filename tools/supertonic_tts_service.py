@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Persistent local Supertonic 3 service returning ESP32-ready PCM."""
+"""Persistent local Supertonic 3 service returning Mac-ready 44.1 kHz PCM."""
 
 from __future__ import annotations
 
@@ -26,10 +26,11 @@ from supertonic import TTS  # noqa: E402
 HOST = os.environ.get("SUPERTONIC_HOST", "127.0.0.1")
 PORT = int(os.environ.get("SUPERTONIC_PORT", "3001"))
 VOICE = os.environ.get("SUPERTONIC_VOICE", "F1")
-STEPS = int(os.environ.get("SUPERTONIC_STEPS", "8"))
+STEPS = int(os.environ.get("SUPERTONIC_STEPS", "32"))
 SPEED = float(os.environ.get("SUPERTONIC_SPEED", "1.0"))
 MAX_TEXT_LENGTH = 500
-TARGET_SAMPLE_RATE = 16000
+# Mac speaker playback; no longer downsampled for the ESP32 speaker.
+TARGET_SAMPLE_RATE = int(os.environ.get("SUPERTONIC_SAMPLE_RATE", "44100"))
 
 
 def wav_to_pcm(body: bytes) -> bytes:
@@ -54,7 +55,8 @@ class Engine:
         self.load_seconds = time.perf_counter() - started
         print(
             f"[Supertonic] ready version={version('supertonic')} voice={VOICE} "
-            f"native_rate={self.tts.sample_rate} load={self.load_seconds:.2f}s",
+            f"steps={STEPS} native_rate={self.tts.sample_rate} "
+            f"output_rate={TARGET_SAMPLE_RATE} load={self.load_seconds:.2f}s",
             flush=True,
         )
 
@@ -126,6 +128,7 @@ class Handler(BaseHTTPRequestHandler):
                 "voice": VOICE,
                 "sample_rate": TARGET_SAMPLE_RATE,
                 "native_sample_rate": ENGINE.tts.sample_rate,
+                "steps": STEPS,
             },
         )
 
