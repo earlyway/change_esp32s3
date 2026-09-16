@@ -6,7 +6,6 @@
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <Wire.h>
-#include <freertos/stream_buffer.h>
 #include <math.h>
 #include <string.h>
 #include <strings.h>
@@ -14,11 +13,15 @@
 #include "hardware_pins.h"
 #include "tca9555.h"
 #include "cst816d.h"
-#include "es8311.h"
 #include "es7210.h"
 #include "server_config.h"
 #include "wifi_credentials.h"
 #include "animation_frames.h"
+
+// Roles: this board captures the microphones (ES7210) and shows the face.
+// All TTS audio plays on the Mac speaker; the board only mirrors the robot
+// state (idle / thinking / speaking + emotion) that the server reports on
+// GET /speaker/pull. The onboard ES8311 speaker path is not used.
 
 namespace {
 // Waveshare 2inch ST7789T3: native 240x320, shown landscape as 320x240.
@@ -30,81 +33,15 @@ CST816D touch(I2C_ADDR_CST816D);
 bool displayReady = false;
 bool touchReady = false;
 
-// Waveshare audio board: ES7210 microphones and ES8311 speaker share I2S0.
+// I2S0 runs RX-only for the ES7210 microphone ADC.
 constexpr i2s_port_t I2S_PORT = I2S_NUM_0;
-constexpr i2s_port_t SPK_I2S_PORT = I2S_PORT;
 constexpr size_t kI2sReadFrames = 256;
 int16_t i2sRawBuffer[kI2sReadFrames * 2]; // interleaved L/R from ES7210
-es8311_handle_t speakerCodec = nullptr;
 es7210_dev_handle_t micCodec = nullptr;
 bool micReady = false;
-bool speakerReady = false;
-constexpr int kDefaultSpeakerVolume = 90;
-constexpr int kSpeakerVolumeStep = 10;
-volatile int speakerVolume = kDefaultSpeakerVolume;
 
-enum TestTune : int {
-  kTuneNone = 0,
-  kTuneBeep = 1,
-  kTuneRedRed = 2,
-};
-int testTunePlaying = kTuneNone;
-int pendingSerialChar = -1;
-
-int readSerialChar() {
-  if (pendingSerialChar >= 0) {
-    const int c = pendingSerialChar;
-    pendingSerialChar = -1;
-    return c;
-  }
-  if (Serial.available() > 0) return Serial.read();
-  return -1;
-}
-
-bool testTuneStopRequested() {
-  while (true) {
-    const int c = (pendingSerialChar >= 0 || Serial.available() > 0)
-                      ? readSerialChar()
-                      : -1;
-    if (c < 0) return false;
-    const bool stopBeep = testTunePlaying == kTuneBeep && (c == 'b' || c == 'B');
-    const bool stopRedRed =
-        testTunePlaying == kTuneRedRed && (c == 'p' || c == 'P');
-    if (!stopBeep && !stopRedRed) {
-      pendingSerialChar = c;
-      return false;
-    }
-    // Drop extra repeats of the same key so loop() does not restart playback.
-    while (Serial.available() > 0) {
-      const int next = Serial.peek();
-      if ((stopBeep && (next == 'b' || next == 'B')) ||
-          (stopRedRed && (next == 'p' || next == 'P'))) {
-        Serial.read();
-      } else {
-        break;
-      }
-    }
-    return true;
-  }
-}
-
-// Speaker downlink uses a 3-second ring buffer. The network task fills it while
-// a dedicated playback task drains it, so one-second HTTP chunk boundaries do
-// not reset I2S or create audible gaps.
-constexpr size_t kSpeakerBytesPerSecond = AUDIO_SAMPLE_RATE * sizeof(int16_t);
-constexpr size_t kSpeakerRingBytes = kSpeakerBytesPerSecond * 3;
-constexpr size_t kSpeakerPrebufferBytes = kSpeakerBytesPerSecond / 4; // 250 ms
-StreamBufferHandle_t speakerPcmStream = nullptr;
-StaticStreamBuffer_t speakerPcmStreamControl;
-uint8_t* speakerPcmStorage = nullptr;
-volatile bool speakerDownlinkPlaying = false;
-volatile bool speakerStreamOpen = false;
-volatile bool speakerStreamEndPending = false;
-volatile uint32_t speakerLastDataMs = 0;
-char speakerEmotion[24] = "none";
-// Phase 4: -1 = no face. faceHoldUntilMs is millis() deadline (Arduino wrap-safe).
+// Face shown while the Mac is speaking (from X-Emotion). -1 = none.
 volatile int faceEmotionIndex = -1;
-volatile uint32_t faceHoldUntilMs = 0;
 
 enum RobotUi : int {
   kUiIdle = 0,
@@ -112,15 +49,20 @@ enum RobotUi : int {
   kUiThink = 2,
   kUiSpeak = 3,
 };
+// Last state reported by the server and when it was received. A stale value
+// (Mac unreachable mid-reply) must not leave the face stuck in speak/think.
 volatile int serverRobotState = kUiIdle;
-volatile bool speakerBargeIn = false;
+volatile uint32_t serverStateUpdatedMs = 0;
+constexpr uint32_t kServerStateStaleMs = 5000;
+// PTT during a reply: networkTask POSTs /speaker/flush so the Mac stops.
+volatile bool bargeInPending = false;
 // Set by audioTask once the PTT tail chunk has been handed off; networkTask
 // then POSTs /utterance/end so the Mac finalizes STT without waiting.
 volatile bool pttEndPending = false;
 int lastLoggedUi = -1;
 
 // What networkTask is doing right now; printed when a mic chunk overflows so
-// the cause (slow POST vs. speaker pull vs. flush) is visible in the log.
+// the cause (slow POST vs. state poll vs. flush) is visible in the log.
 enum NetActivity : int {
   kNetIdle = 0,
   kNetPost = 1,
@@ -133,8 +75,8 @@ volatile int netActivity = kNetIdle;
 const char* netActivityName(int a) {
   switch (a) {
     case kNetPost: return "POST";
-    case kNetPull: return "speaker pull";
-    case kNetFlush: return "speaker flush";
+    case kNetPull: return "state poll";
+    case kNetFlush: return "barge-in flush";
     case kNetEnd: return "utterance/end";
     default: return "idle";
   }
@@ -281,6 +223,7 @@ bool initDisplay() {
   exio.pinMode(EXIO_KEY1, INPUT);
   exio.pinMode(EXIO_KEY2, INPUT);
   exio.pinMode(EXIO_KEY3, INPUT);
+  // Speaker amplifier stays off: the board's speaker is not used.
   exio.digitalWrite(EXIO_PA_CTRL, LOW);
   exio.digitalWrite(EXIO_LCD_RST, LOW);
   exio.digitalWrite(EXIO_TP_RST, LOW);
@@ -339,22 +282,24 @@ void applyServerRobotState(const String& header) {
     return;
   }
   serverRobotState = parseRobotState(header.c_str());
+  serverStateUpdatedMs = millis();
 }
 
-bool faceHoldActive(uint32_t now) {
-  const int face = faceEmotionIndex;
-  return face >= 0 && face < ANIM_EMOTION_COUNT && (int32_t)(now - faceHoldUntilMs) < 0;
+bool serverStateFresh(uint32_t now) {
+  return (now - serverStateUpdatedMs) < kServerStateStaleMs;
 }
 
 int effectiveUi(uint32_t now) {
   if (micActive) {
     return kUiListen;
   }
-  // Keep the face up while PCM is being received, buffered, or played.
-  if (speakerStreamOpen || speakerDownlinkPlaying || faceHoldActive(now)) {
+  if (!serverStateFresh(now)) {
+    return kUiIdle;
+  }
+  if (serverRobotState == kUiSpeak) {
     return kUiSpeak;
   }
-  if (serverRobotState == kUiThink || serverRobotState == kUiSpeak) {
+  if (serverRobotState == kUiThink) {
     return kUiThink;
   }
   return kUiIdle;
@@ -366,14 +311,6 @@ void logUiIfChanged(int ui) {
   }
   lastLoggedUi = ui;
   Serial.printf("[State] %s\n", uiName(ui));
-}
-
-void drawThinkingScreen() {
-  tft.fillScreen(ST77XX_BLACK);
-  tft.setTextSize(3);
-  tft.setTextColor(ST77XX_YELLOW);
-  tft.setCursor(20, 110);
-  tft.println("THINKING");
 }
 
 void drawStatusRow(int16_t y, const char* label, const char* value,
@@ -404,10 +341,12 @@ void drawStatusScreen() {
   }
   snprintf(chunks, sizeof(chunks), "%lu", static_cast<unsigned long>(postedChunks));
 
+  const uint32_t now = millis();
   const bool wifiConnected = WiFi.status() == WL_CONNECTED;
   const String ip = wifiConnected ? WiFi.localIP().toString() : "-";
+  const bool robotFresh = serverStateFresh(now);
   drawStatusRow(0,   "",        "ESP32-S3 AUDIO", ST77XX_CYAN);
-  drawStatusRow(24,  "Mode: ",  micActive ? "LISTEN" : uiName(effectiveUi(millis())),
+  drawStatusRow(24,  "Mode: ",  micActive ? "LISTEN" : uiName(effectiveUi(now)),
                 micActive ? ST77XX_GREEN : ST77XX_WHITE);
   drawStatusRow(48,  "WiFi: ",  wifiConnected ? "OK" : "WAIT",
                 wifiConnected ? ST77XX_GREEN : ST77XX_YELLOW);
@@ -417,11 +356,9 @@ void drawStatusScreen() {
                 micActive ? ST77XX_GREEN : ST77XX_WHITE);
   drawStatusRow(144, "POST: ",  post);
   drawStatusRow(168, "Chunks: ", chunks);
-  drawStatusRow(192, "Spk: ",   speakerDownlinkPlaying ? "PLAY" : "IDLE",
-                speakerDownlinkPlaying ? ST77XX_GREEN : ST77XX_WHITE);
-  char volume[16];
-  snprintf(volume, sizeof(volume), "%d", speakerVolume);
-  drawStatusRow(216, "Vol: ", volume);
+  drawStatusRow(192, "Robot: ", robotFresh ? uiName(serverRobotState) : "stale",
+                robotFresh ? ST77XX_WHITE : ST77XX_YELLOW);
+  drawStatusRow(216, "TTS: ",   "Mac speaker");
 }
 
 void drawAnimationFrame(size_t frameIndex) {
@@ -564,10 +501,10 @@ void displayTask(void* pvParameters) {
   }
 }
 
-// One full-duplex I2S driver supplies clocks to both ES7210 (RX) and ES8311 (TX).
+// RX-only I2S master: supplies MCLK/BCLK/LRCLK to the ES7210 and reads DIN.
 bool installI2sDriver() {
   i2s_config_t i2sConfig = {};
-  i2sConfig.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_TX);
+  i2sConfig.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_RX);
   i2sConfig.sample_rate = AUDIO_SAMPLE_RATE;
   i2sConfig.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
   i2sConfig.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
@@ -576,7 +513,6 @@ bool installI2sDriver() {
   i2sConfig.dma_buf_count = 8; // Increased for extra safety margin during network load
   i2sConfig.dma_buf_len = 256;
   i2sConfig.use_apll = false;
-  i2sConfig.tx_desc_auto_clear = true;
   i2sConfig.mclk_multiple = I2S_MCLK_MULTIPLE_256;
 
   esp_err_t result = i2s_driver_install(I2S_PORT, &i2sConfig, 0, nullptr);
@@ -586,7 +522,7 @@ bool installI2sDriver() {
   pinConfig.mck_io_num = PIN_I2S_MCLK;
   pinConfig.bck_io_num = PIN_I2S_BCLK;
   pinConfig.ws_io_num = PIN_I2S_LRCLK;
-  pinConfig.data_out_num = PIN_I2S_DOUT;
+  pinConfig.data_out_num = I2S_PIN_NO_CHANGE; // ES8311 speaker path unused
   pinConfig.data_in_num = PIN_I2S_DIN;
 
   result = i2s_set_pin(I2S_PORT, &pinConfig);
@@ -596,7 +532,7 @@ bool installI2sDriver() {
   return true;
 }
 
-bool setupAudioCodecs() {
+bool setupMicCodec() {
   // Dual microphone ADC, matching the verified stage-5 configuration.
   es7210_i2c_config_t micI2c = {};
   micI2c.i2c_port = I2C_NUM_0;
@@ -616,435 +552,14 @@ bool setupAudioCodecs() {
       result = es7210_config_volume(micCodec, 0);
     }
   }
-  micReady = (result == ESP_OK);
-  if (!micReady) {
+  if (result != ESP_OK) {
     Serial.printf("[Mic] ES7210 setup failed: %s\n", esp_err_to_name(result));
   }
-
-  // Speaker DAC/codec, matching the verified stage-4 configuration.
-  speakerCodec = es8311_create(I2C_NUM_0, ES8311_ADDRESS_0);
-  if (speakerCodec == nullptr) {
-    Serial.println("[Speaker] ES8311 create failed");
-    return false;
-  }
-  es8311_clock_config_t speakerClock = {};
-  speakerClock.mclk_inverted = false;
-  speakerClock.sclk_inverted = false;
-  speakerClock.mclk_from_mclk_pin = true;
-  speakerClock.mclk_frequency = AUDIO_SAMPLE_RATE * 256;
-  speakerClock.sample_frequency = AUDIO_SAMPLE_RATE;
-  result = es8311_init(
-      speakerCodec, &speakerClock, ES8311_RESOLUTION_16, ES8311_RESOLUTION_16);
-  if (result == ESP_OK) {
-    int applied = kDefaultSpeakerVolume;
-    result = es8311_voice_volume_set(
-        speakerCodec, kDefaultSpeakerVolume, &applied);
-    if (result == ESP_OK) {
-      speakerVolume = applied;
-    }
-  }
-  if (result == ESP_OK) {
-    result = es8311_microphone_config(speakerCodec, false);
-  }
-  if (result != ESP_OK) {
-    Serial.printf("[Speaker] ES8311 setup failed: %s\n", esp_err_to_name(result));
-    return false;
-  }
-
-  // Prime TX with silence before enabling the onboard NS4150B amplifier.
-  int16_t silence[128 * 2] = {};
-  size_t bytesWritten = 0;
-  i2s_write(I2S_PORT, silence, sizeof(silence), &bytesWritten, portMAX_DELAY);
-  exio.digitalWrite(EXIO_PA_CTRL, HIGH);
-  delay(50);
-  return true;
+  return result == ESP_OK;
 }
 
-// Play a single sine tone (freqHz == 0 -> silence/rest). Blocking.
-// A short linear fade-in/out envelope avoids click noise between notes.
-// Returns true if the matching serial key stopped playback early.
-bool playTone(float freqHz, uint32_t durationMs, int16_t amplitude = 28000) {
-  constexpr size_t kBlockFrames = 128;
-  constexpr uint32_t kFadeMs = 6;
-
-  const size_t totalFrames = static_cast<size_t>(AUDIO_SAMPLE_RATE) * durationMs / 1000;
-  const size_t fadeFrames = static_cast<size_t>(AUDIO_SAMPLE_RATE) * kFadeMs / 1000;
-
-  int16_t block[kBlockFrames * 2]; // interleaved stereo (L, R per frame)
-  size_t written = 0;
-  while (written < totalFrames) {
-    if (testTuneStopRequested()) return true;
-    size_t count = min(kBlockFrames, totalFrames - written);
-    for (size_t i = 0; i < count; ++i) {
-      size_t n = written + i;
-      float sample = 0.0f;
-      if (freqHz > 0.0f) {
-        float t = static_cast<float>(n) / AUDIO_SAMPLE_RATE;
-        float envelope = 1.0f;
-        if (n < fadeFrames) {
-          envelope = static_cast<float>(n) / fadeFrames;
-        } else if (totalFrames - n <= fadeFrames) {
-          envelope = static_cast<float>(totalFrames - n) / fadeFrames;
-        }
-        sample = envelope * amplitude * sinf(2.0f * PI * freqHz * t);
-      }
-      int16_t s = static_cast<int16_t>(sample);
-      block[2 * i] = s;     // left slot
-      block[2 * i + 1] = s; // right slot
-    }
-    size_t bytesWritten = 0;
-    i2s_write(SPK_I2S_PORT, block, count * 2 * sizeof(int16_t), &bytesWritten, portMAX_DELAY);
-    written += count;
-  }
-  return false;
-}
-
-void applySpeakerVolume(int volume) {
-  if (volume < 0) volume = 0;
-  if (volume > 100) volume = 100;
-  if (!speakerReady || speakerCodec == nullptr) {
-    Serial.println("[Speaker] volume ignored; codec not ready");
-    return;
-  }
-  int applied = volume;
-  if (es8311_voice_volume_set(speakerCodec, volume, &applied) != ESP_OK) {
-    Serial.println("[Speaker] volume set failed");
-    return;
-  }
-  speakerVolume = applied;
-  Serial.printf("[Speaker] volume=%d\n", applied);
-}
-
-// Play a short 440Hz sine beep (~0.5s) through ES8311. Blocking.
-void playTestBeep() {
-  if (!speakerReady) {
-    Serial.println("[Speaker] Not initialized, cannot beep");
-    return;
-  }
-  if (speakerStreamOpen || speakerDownlinkPlaying) {
-    Serial.println("[Speaker] Downlink playing, skip test beep");
-    return;
-  }
-  Serial.println("[Speaker] Test beep start (440Hz, 0.5s); press b again to stop");
-  testTunePlaying = kTuneBeep;
-  const bool stopped = playTone(440.0f, 500);
-  testTunePlaying = kTuneNone;
-  i2s_zero_dma_buffer(SPK_I2S_PORT);
-  Serial.println(stopped ? "[Speaker] Test beep stopped" : "[Speaker] Test beep done");
-}
-
-// Note frequencies (Hz), 4th-6th octave.
-constexpr float NOTE_REST = 0.0f;
-constexpr float NOTE_C5 = 523.25f;
-constexpr float NOTE_D5 = 587.33f;
-
-// ============================================================
-// REDRED synth beat: the melody transcribed from the user's REDRED guitar
-// sheet music (D minor, 121 BPM) played by a synth voice over a
-// kick/snare/hi-hat drum grid. Synth engine ported from a standalone
-// ESP_I2S.h sketch onto this project's shared driver/i2s.h + I2S_NUM_0 setup.
-// Runs at AUDIO_SAMPLE_RATE (16kHz, same as the mic) so it reuses the
-// speaker port config as-is instead of reinstalling the I2S driver.
-// ============================================================
-constexpr float PI2 = 2.0f * PI;
-constexpr float kBeatBpm = 121.0f; // matches the REDRED sheet music tempo
-constexpr float kBeatSec = 60.0f / kBeatBpm;
-constexpr int kBeatsPerBar = 4;
-
-constexpr float NOTE_G4 = 392.00f;
-constexpr float NOTE_A4 = 440.00f;
-
-struct MelodyNote {
-  float freqHz;       // NOTE_* constant, NOTE_REST for silence
-  uint16_t durationMs;
-};
-
-// CORTIS "REDRED", transcribed from all three pages of the guitar sheet music
-// (arr. Woojeong Park, D minor, quarter note = 121 BPM).
-// The vocal line is mostly a D-D-C triplet motif over a Dm/G/F progression
-// (guitar TAB "3 3 1 3 3 1 3" on the B string), played one octave up (D5/C5)
-// so it cuts through the small speaker. The bridge ("다시 배워봐") drops to
-// the lower A4/G4 register (TAB "2 2 2 ... 0" on the G string).
-// Timing at 121 BPM: triplet eighth = 165 ms, eighth = 248 ms, quarter = 496 ms,
-// one 4/4 measure = 1984 ms.
-constexpr MelodyNote kRedRedMelody[] = {
-    // --- Verse (page 1, m5-7) ---
-    // "따바라 한모금 sip"
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 400}, {NOTE_REST, 594},
-    // "카페인이 또 kickinin"
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 248}, {NOTE_C5, 248}, {NOTE_REST, 498},
-    // "어젯밤에 만들던 beat"
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 400}, {NOTE_REST, 594},
-
-    // --- Hook (page 3, m26-28) ---
-    // "주변을 살피기 that's red red"
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 248}, {NOTE_D5, 248}, {NOTE_D5, 400}, {NOTE_REST, 96},
-    // "쿨한척 척하기 that's red red"
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 248}, {NOTE_D5, 248}, {NOTE_D5, 400}, {NOTE_REST, 96},
-    // "you should come mess with the team-eam" (tail drops to C)
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_C5, 248}, {NOTE_C5, 248}, {NOTE_C5, 400}, {NOTE_REST, 96},
-
-    // --- Verse 2 (page 3, m29-31) ---
-    // "친구들 전부 한트럭에 다 담아서" (continuous triplets)
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    // "거리로 나가서 빙 빙"
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_C5, 400}, {NOTE_REST, 96}, {NOTE_C5, 496},
-    // "거리서 돌다가 돌아가 studio"
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 248}, {NOTE_D5, 248},
-
-    // --- Pre-hook (page 3, m32-34) ---
-    // "cookin up till we get stin-ky"
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 496}, {NOTE_REST, 498},
-    // "팔랑귀 팔랑귀 that's red red"
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 248}, {NOTE_D5, 248}, {NOTE_D5, 400}, {NOTE_REST, 96},
-    // "눈치나 살피기 that's red red"
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 248}, {NOTE_D5, 248}, {NOTE_D5, 400}, {NOTE_REST, 96},
-
-    // --- Bridge (page 5, m50-52, lower A4/G4 register) ---
-    // "다시 배워봐 you gotta note down"
-    {NOTE_A4, 165}, {NOTE_A4, 165}, {NOTE_A4, 165},
-    {NOTE_A4, 165}, {NOTE_A4, 165}, {NOTE_G4, 165},
-    {NOTE_A4, 248}, {NOTE_G4, 248}, {NOTE_REST, 498},
-    // "불러와 버려 두번째 혼란"
-    {NOTE_A4, 165}, {NOTE_A4, 165}, {NOTE_A4, 165},
-    {NOTE_A4, 165}, {NOTE_A4, 165}, {NOTE_G4, 165},
-    {NOTE_A4, 400}, {NOTE_G4, 496}, {NOTE_REST, 96},
-    // "신호등 바꼈어 green green"
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_C5, 248}, {NOTE_C5, 248}, {NOTE_REST, 498},
-
-    // --- Outro (page 5, m53 + m58) ---
-    // "you should come mess with the team-eam"
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_C5, 248}, {NOTE_C5, 248}, {NOTE_C5, 400}, {NOTE_REST, 96},
-    // closing "팔랑귀 팔랑귀 that's red red"
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 165}, {NOTE_D5, 165}, {NOTE_C5, 165},
-    {NOTE_D5, 248}, {NOTE_D5, 248}, {NOTE_D5, 800},
-};
-
-uint32_t beatNoiseState = 0x12345678;
-
-float beatNoiseSample() {
-  beatNoiseState ^= beatNoiseState << 13;
-  beatNoiseState ^= beatNoiseState >> 17;
-  beatNoiseState ^= beatNoiseState << 5;
-  return ((beatNoiseState & 0xFFFF) / 32767.5f) - 1.0f;
-}
-
-// Melody voice: sine + slight 2nd harmonic with attack/release envelope.
-// Unlike the original sketch (fixed 0.5s beats), notes here have variable
-// lengths from the REDRED table, so the envelope scales with note duration.
-float synthRedRedVoice(float freqHz, float posSec, float noteSec) {
-  if (freqHz <= 0.0f) return 0.0f;
-
-  const float soundLen = noteSec * 0.92f; // small gap separates repeated notes
-  if (posSec > soundLen) return 0.0f;
-
-  float envelope = 1.0f;
-  if (posSec < 0.008f) {
-    envelope = posSec / 0.008f; // 8ms attack
-  }
-  const float releaseStart = soundLen * 0.70f;
-  if (posSec > releaseStart) {
-    envelope *= 1.0f - (posSec - releaseStart) / (soundLen - releaseStart); // release
-  }
-  envelope = constrain(envelope, 0.0f, 1.0f);
-
-  float phase = PI2 * freqHz * posSec;
-  float fundamental = sinf(phase);
-  float harmonic = sinf(phase * 2.0f) * 0.18f; // slight second harmonic
-  return (fundamental + harmonic) * envelope * 0.38f;
-}
-
-float synthBeatKick(float triggerPosition) {
-  constexpr float kLength = 0.18f;
-  if (triggerPosition < 0 || triggerPosition > kLength) return 0.0f;
-  float freqHz = 45.0f + 105.0f * expf(-triggerPosition * 25.0f); // pitch drop 150Hz -> 45Hz
-  float envelope = expf(-triggerPosition * 18.0f);
-  return sinf(PI2 * freqHz * triggerPosition) * envelope * 0.72f;
-}
-
-float synthBeatSnare(float triggerPosition) {
-  constexpr float kLength = 0.14f;
-  if (triggerPosition < 0 || triggerPosition > kLength) return 0.0f;
-  float envelope = expf(-triggerPosition * 24.0f);
-  float noise = beatNoiseSample();
-  float body = sinf(PI2 * 180.0f * triggerPosition); // body around 180Hz
-  return (noise * 0.75f + body * 0.25f) * envelope * 0.44f;
-}
-
-float synthBeatHiHat(float triggerPosition) {
-  constexpr float kLength = 0.055f;
-  static float previousNoise = 0.0f;
-  if (triggerPosition < 0 || triggerPosition > kLength) return 0.0f;
-  float n = beatNoiseSample();
-  float highPassed = n - previousNoise; // crude high-pass: current - previous
-  previousNoise = n;
-  float envelope = expf(-triggerPosition * 70.0f);
-  return highPassed * envelope * 0.13f;
-}
-
-// Render and play REDRED (melody table + drum grid) once, blocking (~34s).
-// The matching serial key ('p') can stop playback in the middle of a block.
-void playRedRedBeat() {
-  if (!speakerReady) {
-    Serial.println("[Speaker] Not initialized, cannot play beat");
-    return;
-  }
-  if (speakerStreamOpen || speakerDownlinkPlaying) {
-    Serial.println("[Speaker] Downlink playing, skip REDRED");
-    return;
-  }
-
-  constexpr size_t kBlockFrames = 128;
-  constexpr size_t kNoteCount = sizeof(kRedRedMelody) / sizeof(kRedRedMelody[0]);
-  const uint32_t samplesPerBeat = static_cast<uint32_t>(AUDIO_SAMPLE_RATE * kBeatSec);
-  const uint32_t samplesPerEighth = samplesPerBeat / 2;
-
-  uint32_t totalSamples = 0;
-  for (size_t i = 0; i < kNoteCount; ++i) {
-    totalSamples += static_cast<uint32_t>(AUDIO_SAMPLE_RATE) * kRedRedMelody[i].durationMs / 1000;
-  }
-
-  Serial.printf("[Speaker] REDRED beat start (%u notes, %.0f BPM, ~%us); "
-                "press p again to stop\n",
-                static_cast<unsigned>(kNoteCount), static_cast<double>(kBeatBpm),
-                static_cast<unsigned>(totalSamples / AUDIO_SAMPLE_RATE));
-
-  testTunePlaying = kTuneRedRed;
-  int16_t block[kBlockFrames * 2]; // interleaved stereo (L, R per frame)
-  size_t noteIndex = 0;
-  uint32_t noteStartSample = 0;
-  uint32_t noteSamples =
-      static_cast<uint32_t>(AUDIO_SAMPLE_RATE) * kRedRedMelody[0].durationMs / 1000;
-  uint32_t sampleIndex = 0;
-
-  while (sampleIndex < totalSamples) {
-    if (testTuneStopRequested()) {
-      i2s_zero_dma_buffer(SPK_I2S_PORT);
-      testTunePlaying = kTuneNone;
-      Serial.println("[Speaker] REDRED beat stopped");
-      return;
-    }
-    size_t count = min(kBlockFrames, static_cast<size_t>(totalSamples - sampleIndex));
-
-    for (size_t i = 0; i < count; ++i) {
-      uint32_t currentSample = sampleIndex + static_cast<uint32_t>(i);
-
-      // Advance to the melody note containing this sample.
-      while (noteIndex < kNoteCount && currentSample >= noteStartSample + noteSamples) {
-        noteStartSample += noteSamples;
-        noteIndex++;
-        if (noteIndex < kNoteCount) {
-          noteSamples =
-              static_cast<uint32_t>(AUDIO_SAMPLE_RATE) * kRedRedMelody[noteIndex].durationMs / 1000;
-        }
-      }
-
-      float audio = 0.0f;
-      if (noteIndex < kNoteCount) {
-        float posSec = static_cast<float>(currentSample - noteStartSample) / AUDIO_SAMPLE_RATE;
-        float noteSec = kRedRedMelody[noteIndex].durationMs / 1000.0f;
-        audio += synthRedRedVoice(kRedRedMelody[noteIndex].freqHz, posSec, noteSec);
-      }
-
-      // Drum grid at 121 BPM: 8 steps/bar. HH every 8th, KD on steps 0/4
-      // (+ fill on the last 8th of every 4th bar), SN on steps 2/6.
-      uint32_t eighthIndex = currentSample / samplesPerEighth;
-      uint32_t eighthSample = currentSample % samplesPerEighth;
-      float eighthPosition = static_cast<float>(eighthSample) / AUDIO_SAMPLE_RATE;
-      int stepInBar = eighthIndex % 8;
-      uint32_t beatIndex = currentSample / samplesPerBeat;
-      uint32_t currentBar = beatIndex / kBeatsPerBar;
-
-      audio += synthBeatHiHat(eighthPosition);
-      if (stepInBar == 0 || stepInBar == 4) {
-        audio += synthBeatKick(eighthPosition);
-      }
-      if ((currentBar % 4) == 3 && stepInBar == 7) {
-        audio += synthBeatKick(eighthPosition);
-      }
-      if (stepInBar == 2 || stepInBar == 6) {
-        audio += synthBeatSnare(eighthPosition);
-      }
-
-      audio = constrain(audio, -0.90f, 0.90f);
-      int16_t s = static_cast<int16_t>(audio * 32767.0f);
-      block[2 * i] = s;     // left slot
-      block[2 * i + 1] = s; // right slot
-    }
-
-    size_t bytesWritten = 0;
-    i2s_write(SPK_I2S_PORT, block, count * 2 * sizeof(int16_t), &bytesWritten, portMAX_DELAY);
-    sampleIndex += count;
-  }
-
-  i2s_zero_dma_buffer(SPK_I2S_PORT);
-  testTunePlaying = kTuneNone;
-  Serial.println("[Speaker] REDRED beat done");
-}
-
-// Play one mono 16-bit PCM buffer as stereo (duplicated L/R) on shared I2S0.
-void playPcmMono16(const int16_t* samples, size_t sampleCount) {
-  constexpr size_t kBlockFrames = 128;
-  int16_t block[kBlockFrames * 2];
-  size_t written = 0;
-  uint8_t stallTries = 0;
-  while (written < sampleCount) {
-    if (speakerBargeIn) {
-      break;
-    }
-    size_t count = min(kBlockFrames, sampleCount - written);
-    for (size_t i = 0; i < count; ++i) {
-      int16_t s = samples[written + i];
-      block[2 * i] = s;
-      block[2 * i + 1] = s;
-    }
-    size_t bytesWritten = 0;
-    const esp_err_t err = i2s_write(
-        SPK_I2S_PORT, block, count * 2 * sizeof(int16_t), &bytesWritten, pdMS_TO_TICKS(100));
-    if (err != ESP_OK || bytesWritten < 4) {
-      vTaskDelay(pdMS_TO_TICKS(1));
-      if (++stallTries >= 20) {
-        break;
-      }
-      continue;
-    }
-    stallTries = 0;
-    written += bytesWritten / (2 * sizeof(int16_t));
-  }
-}
-
-void flushSpeakerQueue(const String& flushUrl) {
+// Barge-in: tell the Mac to stop the reply that is playing/being produced.
+void flushRobotSpeech(const String& flushUrl) {
   netActivity = kNetFlush;
   HTTPClient http;
   http.setConnectTimeout(1000);
@@ -1059,7 +574,7 @@ void flushSpeakerQueue(const String& flushUrl) {
   body.trim();
   http.end();
   netActivity = kNetIdle;
-  Serial.printf("[Speaker] flush HTTP %d %s\n", code, body.c_str());
+  Serial.printf("[Robot] flush HTTP %d %s\n", code, body.c_str());
 }
 
 bool postUtteranceEnd(const String& endUrl) {
@@ -1084,12 +599,9 @@ bool postUtteranceEnd(const String& endUrl) {
   return code == 200;
 }
 
-// Returns true when a PCM chunk was received (caller should poll again soon).
-bool pollSpeakerPull(const String& pullUrl) {
-  if (!speakerReady || speakerPcmStream == nullptr) {
-    return false;
-  }
-
+// Poll the server for robot state (idle / thinking / speaking + emotion). The
+// Mac plays the audio itself, so the response body (if any) is ignored.
+void pollRobotState(const String& pullUrl) {
   netActivity = kNetPull;
   HTTPClient http;
   // Short connect timeout: a dead/unreachable Mac must not stall mic uploads.
@@ -1097,301 +609,25 @@ bool pollSpeakerPull(const String& pullUrl) {
   http.setTimeout(2000);
   if (!http.begin(pullUrl)) {
     netActivity = kNetIdle;
-    return false;
-  }
-  const char* headerKeys[] = {"X-Emotion", "X-Sample-Rate", "X-Robot-State"};
-  http.collectHeaders(headerKeys, 3);
-
-  int httpCode = http.GET();
-  if (httpCode == 204 || httpCode == HTTP_CODE_NO_CONTENT) {
-    applyServerRobotState(http.header("X-Robot-State"));
-    // TTS now plays on the Mac speaker: no PCM comes back, so the face must
-    // follow the server state instead of local playback.
-    if (!speakerStreamOpen && !speakerDownlinkPlaying) {
-      if (serverRobotState == kUiSpeak) {
-        String emotion = http.header("X-Emotion");
-        faceEmotionIndex = emotionIndexFromTag(emotion.c_str());
-        // Hold past the next busy poll so the face does not flicker between polls.
-        faceHoldUntilMs = millis() + 1500;
-      } else if (faceHoldActive(millis())) {
-        faceHoldUntilMs = millis();
-      }
-    }
-    http.end();
-    netActivity = kNetIdle;
-    return false;
-  }
-  if (httpCode != 200) {
-    if (httpCode < 0) {
-      Serial.printf("[Speaker] pull failed: %s\n", http.errorToString(httpCode).c_str());
-    } else {
-      Serial.printf("[Speaker] pull HTTP %d\n", httpCode);
-    }
-    http.end();
-    netActivity = kNetIdle;
-    return false;
-  }
-
-  String emotion = http.header("X-Emotion");
-  if (emotion.length() > 0 && emotion.length() < sizeof(speakerEmotion)) {
-    strncpy(speakerEmotion, emotion.c_str(), sizeof(speakerEmotion) - 1);
-    speakerEmotion[sizeof(speakerEmotion) - 1] = '\0';
-  } else {
-    strncpy(speakerEmotion, "none", sizeof(speakerEmotion) - 1);
-  }
-
-  // Mark the stream open before applying a possible idle state so the face
-  // does not flash think/idle for one frame on the last (or first) chunk.
-  speakerStreamOpen = true;
-  applyServerRobotState(http.header("X-Robot-State"));
-
-  int len = http.getSize();
-  WiFiClient* stream = http.getStreamPtr();
-  if (stream == nullptr) {
-    http.end();
-    netActivity = kNetIdle;
-    return false;
-  }
-  stream->setTimeout(50);
-
-  speakerStreamEndPending = false;
-  faceEmotionIndex = emotionIndexFromTag(speakerEmotion);
-  faceHoldUntilMs = millis() + 60000;
-  Serial.printf("[Speaker] receive start emotion=%s content_length=%d buffered=%u\n",
-                speakerEmotion,
-                len,
-                static_cast<unsigned>(xStreamBufferBytesAvailable(speakerPcmStream)));
-
-  constexpr size_t kScratchBytes = 1024;
-  uint8_t scratch[kScratchBytes];
-  size_t totalBytes = 0;
-  uint32_t idleMs = 0;
-  const uint32_t kIdleGiveUpMs = 400;
-  int remaining = len;
-  const uint32_t pullStartedMs = millis();
-  const uint32_t pullBudgetMs = (len > 0)
-      ? static_cast<uint32_t>(len) / 2 * 1000 / AUDIO_SAMPLE_RATE + 4000
-      : 8000;
-
-  while (true) {
-    if (speakerBargeIn) {
-      Serial.println("[Speaker] pull abort: barge-in");
-      break;
-    }
-    if ((int32_t)(millis() - pullStartedMs) >= (int32_t)pullBudgetMs) {
-      Serial.println("[Speaker] pull abort: timeout");
-      break;
-    }
-    if (len > 0 && remaining <= 0) {
-      break;
-    }
-    const int avail = stream->available();
-    if (avail < 1) {
-      vTaskDelay(pdMS_TO_TICKS(5));
-      idleMs += 5;
-      if (idleMs >= kIdleGiveUpMs) {
-        break;
-      }
-      continue;
-    }
-    size_t want = sizeof(scratch);
-    if (static_cast<size_t>(avail) < want) {
-      want = static_cast<size_t>(avail);
-    }
-    if (len > 0 && static_cast<size_t>(remaining) < want) {
-      want = static_cast<size_t>(remaining);
-    }
-    if (want % 2 == 1) {
-      want -= 1;
-    }
-    if (want == 0) {
-      break;
-    }
-
-    const int got = stream->read(scratch, want);
-    if (got <= 0) {
-      vTaskDelay(pdMS_TO_TICKS(5));
-      idleMs += 5;
-      if (idleMs >= kIdleGiveUpMs) {
-        break;
-      }
-      continue;
-    }
-    idleMs = 0;
-    int evenGot = got;
-    if (evenGot % 2 == 1) {
-      evenGot -= 1;
-    }
-    if (evenGot < 2) {
-      break;
-    }
-
-    size_t queued = 0;
-    while (queued < static_cast<size_t>(evenGot) && !speakerBargeIn) {
-      const size_t sent = xStreamBufferSend(
-          speakerPcmStream,
-          scratch + queued,
-          static_cast<size_t>(evenGot) - queued,
-          pdMS_TO_TICKS(100));
-      if (sent == 0) {
-        continue;
-      }
-      queued += sent;
-      speakerLastDataMs = millis();
-    }
-    totalBytes += queued;
-    if (len > 0) {
-      remaining -= evenGot;
-    }
-  }
-
-  http.end();
-  netActivity = kNetIdle;
-  if (speakerBargeIn) {
-    Serial.println("[Speaker] receive abort: barge-in");
-  } else if (serverRobotState != kUiSpeak) {
-    // The server removes a chunk from its queue before responding. If the
-    // resulting state is no longer "speaking", this response is the final
-    // chunk; playback owns the final drain and the single I2S reset.
-    speakerStreamEndPending = true;
-  }
-
-  Serial.printf("[Speaker] receive done bytes=%u (~%u ms) buffered=%u end=%d\n",
-                static_cast<unsigned>(totalBytes),
-                static_cast<unsigned>(totalBytes / 2 * 1000 / AUDIO_SAMPLE_RATE),
-                static_cast<unsigned>(xStreamBufferBytesAvailable(speakerPcmStream)),
-                speakerStreamEndPending ? 1 : 0);
-  return true;
-}
-
-void discardBufferedSpeakerPcm() {
-  if (speakerPcmStream == nullptr) return;
-  uint8_t discard[512];
-  while (xStreamBufferReceive(speakerPcmStream, discard, sizeof(discard), 0) > 0) {
-  }
-}
-
-void finishSpeakerPlayback(bool bargedIn) {
-  discardBufferedSpeakerPcm();
-  if (!bargedIn) {
-    // i2s_write() returns after copying into the eight 256-frame DMA buffers.
-    // Let their final ~128 ms reach the codec before clearing them, otherwise
-    // the last Korean syllable can be clipped.
-    for (int i = 0; i < 14; ++i) {
-      if (speakerBargeIn) {
-        bargedIn = true;
-        break;
-      }
-      vTaskDelay(pdMS_TO_TICKS(10));
-    }
-  }
-  i2s_zero_dma_buffer(SPK_I2S_PORT);
-  speakerDownlinkPlaying = false;
-  speakerStreamOpen = false;
-  speakerStreamEndPending = false;
-
-  if (bargedIn) {
-    faceEmotionIndex = -1;
-    faceHoldUntilMs = millis();
-    serverRobotState = kUiIdle;
-    Serial.println("[Speaker] buffered playback stopped by PTT");
-  } else {
-    faceHoldUntilMs = millis() + 400;
-    Serial.println("[Speaker] buffered playback complete");
-  }
-}
-
-void speakerPlaybackTask(void* pvParameters) {
-  Serial.printf("[Task] Speaker playback task started on Core 1 (ring=%u bytes, prebuffer=%u ms)\n",
-                static_cast<unsigned>(kSpeakerRingBytes),
-                static_cast<unsigned>(kSpeakerPrebufferBytes * 1000 / kSpeakerBytesPerSecond));
-
-  if (!speakerReady || speakerPcmStream == nullptr) {
-    Serial.println("[Task] Speaker ring buffer unavailable! Task suspending.");
-    vTaskDelete(nullptr);
     return;
   }
+  const char* headerKeys[] = {"X-Emotion", "X-Robot-State"};
+  http.collectHeaders(headerKeys, 2);
 
-  constexpr size_t kPlaybackSamples = 256;
-  int16_t samples[kPlaybackSamples];
-  bool bargeHandled = false;
-
-  while (true) {
-    if (speakerBargeIn) {
-      if (!bargeHandled) {
-        finishSpeakerPlayback(true);
-        bargeHandled = true;
-      }
-      vTaskDelay(pdMS_TO_TICKS(5));
-      continue;
+  const int httpCode = http.GET();
+  if (httpCode == 204 || httpCode == HTTP_CODE_NO_CONTENT || httpCode == 200) {
+    applyServerRobotState(http.header("X-Robot-State"));
+    if (serverRobotState == kUiSpeak) {
+      String emotion = http.header("X-Emotion");
+      faceEmotionIndex = emotionIndexFromTag(emotion.c_str());
     }
-    bargeHandled = false;
-
-    const size_t buffered = xStreamBufferBytesAvailable(speakerPcmStream);
-    if (!speakerDownlinkPlaying) {
-      const bool readyToStart =
-          speakerStreamOpen &&
-          (buffered >= kSpeakerPrebufferBytes ||
-           (speakerStreamEndPending && buffered > 0));
-      if (!readyToStart) {
-        vTaskDelay(pdMS_TO_TICKS(5));
-        continue;
-      }
-
-      speakerDownlinkPlaying = true;
-      faceEmotionIndex = emotionIndexFromTag(speakerEmotion);
-      faceHoldUntilMs = millis() + 60000;
-      // Fill the eight 256-frame TX DMA buffers (~128 ms) before any Serial
-      // I/O. TX auto-clear would otherwise play zeros while this task logs,
-      // which clips the first Korean syllable.
-      constexpr size_t kPrimeBytes = 2048 * sizeof(int16_t);
-      size_t primed = 0;
-      while (primed < kPrimeBytes && !speakerBargeIn) {
-        const size_t got = xStreamBufferReceive(
-            speakerPcmStream, samples, sizeof(samples), 0);
-        const size_t even = got & ~static_cast<size_t>(1);
-        if (even < 2) {
-          break;
-        }
-        playPcmMono16(samples, even / sizeof(int16_t));
-        primed += even;
-      }
-      Serial.printf("[Speaker] buffered playback start bytes=%u primed=%u\n",
-                    static_cast<unsigned>(buffered),
-                    static_cast<unsigned>(primed));
-    }
-
-    const size_t received = xStreamBufferReceive(
-        speakerPcmStream, samples, sizeof(samples), pdMS_TO_TICKS(20));
-    const size_t evenBytes = received & ~static_cast<size_t>(1);
-    if (evenBytes > 0) {
-      playPcmMono16(samples, evenBytes / sizeof(int16_t));
-      continue;
-    }
-
-    if (speakerStreamEndPending &&
-        xStreamBufferBytesAvailable(speakerPcmStream) == 0) {
-      finishSpeakerPlayback(false);
-      continue;
-    }
-
-    if (speakerDownlinkPlaying && speakerStreamOpen && !speakerStreamEndPending) {
-      static uint32_t lastUnderrunLogMs = 0;
-      const uint32_t nowMs = millis();
-      if (nowMs - lastUnderrunLogMs > 250) {
-        lastUnderrunLogMs = nowMs;
-        Serial.printf("[Speaker] ring underrun buffered=%u\n",
-                      static_cast<unsigned>(xStreamBufferBytesAvailable(speakerPcmStream)));
-      }
-    }
-
-    // Recover from a lost final response without leaving the UI permanently
-    // speaking. Normal one-second chunk boundaries are far below this timeout.
-    if (speakerStreamOpen && serverRobotState != kUiSpeak &&
-        millis() - speakerLastDataMs > 2000) {
-      speakerStreamEndPending = true;
-    }
+  } else if (httpCode < 0) {
+    Serial.printf("[Robot] state poll failed: %s\n", http.errorToString(httpCode).c_str());
+  } else {
+    Serial.printf("[Robot] state poll HTTP %d\n", httpCode);
   }
+  http.end();
+  netActivity = kNetIdle;
 }
 
 // WiFi status helpers
@@ -1419,19 +655,10 @@ void audioTask(void* pvParameters) {
 
   while (true) {
     size_t bytesRead = 0;
-    // During speaker playback the same I2S port is also transmitting. A blocking
-    // RX wait holds the driver lock and lets TX DMA auto-clear, which sounds
-    // like the first 1–2 syllables dropping out.
-    const TickType_t readWait =
-        speakerDownlinkPlaying ? 0 : pdMS_TO_TICKS(100);
     esp_err_t result = i2s_read(
-        I2S_PORT, i2sRawBuffer, sizeof(i2sRawBuffer), &bytesRead, readWait);
+        I2S_PORT, i2sRawBuffer, sizeof(i2sRawBuffer), &bytesRead, pdMS_TO_TICKS(100));
 
     if (result != ESP_OK || bytesRead == 0) {
-      if (speakerDownlinkPlaying) {
-        vTaskDelay(pdMS_TO_TICKS(1));
-        continue;
-      }
       Serial.printf("[Task] I2S read error: %d, bytes=%u\n", result, bytesRead);
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
@@ -1524,17 +751,17 @@ void networkTask(void* pvParameters) {
   serverUrl += POST_SERVER_PORT;
   serverUrl += POST_SERVER_PATH;
 
-  String speakerPullUrl = "http://";
-  speakerPullUrl += POST_SERVER_HOST;
-  speakerPullUrl += ':';
-  speakerPullUrl += POST_SERVER_PORT;
-  speakerPullUrl += SPEAKER_PULL_PATH;
+  String statePullUrl = "http://";
+  statePullUrl += POST_SERVER_HOST;
+  statePullUrl += ':';
+  statePullUrl += POST_SERVER_PORT;
+  statePullUrl += SPEAKER_PULL_PATH;
 
-  String speakerFlushUrl = "http://";
-  speakerFlushUrl += POST_SERVER_HOST;
-  speakerFlushUrl += ':';
-  speakerFlushUrl += POST_SERVER_PORT;
-  speakerFlushUrl += SPEAKER_FLUSH_PATH;
+  String flushUrl = "http://";
+  flushUrl += POST_SERVER_HOST;
+  flushUrl += ':';
+  flushUrl += POST_SERVER_PORT;
+  flushUrl += SPEAKER_FLUSH_PATH;
 
   String utteranceEndUrl = "http://";
   utteranceEndUrl += POST_SERVER_HOST;
@@ -1542,14 +769,13 @@ void networkTask(void* pvParameters) {
   utteranceEndUrl += POST_SERVER_PORT;
   utteranceEndUrl += UTTERANCE_END_PATH;
 
-  Serial.printf("[Speaker] Pull target: %s\n", speakerPullUrl.c_str());
+  Serial.printf("[Robot] State poll target: %s\n", statePullUrl.c_str());
 
   uint32_t lastConnectAttemptMs = millis();
-  // Idle: poll every 2 s. Server thinking/speaking or a chunk just played:
-  // poll quickly so 1 s TTS chunks play back-to-back and speech starts fast.
+  // Idle: poll every 2 s. Server thinking/speaking: poll quickly so the face
+  // follows the Mac's reply closely.
   constexpr uint32_t kPollIdleMs = 2000;
   constexpr uint32_t kPollBusyMs = 300;
-  constexpr uint32_t kPollStreamMs = 20;
   uint32_t pollWaitMs = kPollIdleMs;
 
   while (true) {
@@ -1561,12 +787,15 @@ void networkTask(void* pvParameters) {
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
       lastConnectAttemptMs = nowMs;
     }
-    if (speakerBargeIn && !speakerDownlinkPlaying && WiFi.status() == WL_CONNECTED) {
-      flushSpeakerQueue(speakerFlushUrl);
-      speakerBargeIn = false;
+    if (bargeInPending && WiFi.status() == WL_CONNECTED) {
+      flushRobotSpeech(flushUrl);
+      bargeInPending = false;
+      // The Mac stopped; do not keep showing the old reply until the next poll.
+      serverRobotState = kUiIdle;
+      serverStateUpdatedMs = millis();
     }
 
-    // Prefer mic upload; otherwise poll the Mac for a speaker chunk.
+    // Prefer mic upload; otherwise poll the Mac for robot state.
     // A pending end marker only waits briefly so it goes out right after the
     // tail chunk (the semaphore is given before pttEndPending is set).
     const uint32_t waitMs = pttEndPending ? 50 : pollWaitMs;
@@ -1651,17 +880,17 @@ void networkTask(void* pvParameters) {
       }
     } else if (micActive) {
       // User is talking: keep the network task free for mic chunks. Nothing
-      // needs to be pulled now (barge-in flush is handled above).
+      // needs to be polled now (barge-in flush is handled above).
       pollWaitMs = kPollBusyMs;
     } else if (WiFi.status() == WL_CONNECTED) {
-      const bool gotChunk = pollSpeakerPull(speakerPullUrl);
-      if (speakerBargeIn) {
-        flushSpeakerQueue(speakerFlushUrl);
-        speakerBargeIn = false;
+      pollRobotState(statePullUrl);
+      if (bargeInPending) {
+        flushRobotSpeech(flushUrl);
+        bargeInPending = false;
+        serverRobotState = kUiIdle;
+        serverStateUpdatedMs = millis();
       }
-      if (gotChunk) {
-        pollWaitMs = kPollStreamMs;
-      } else if (serverRobotState == kUiThink || serverRobotState == kUiSpeak) {
+      if (serverRobotState == kUiThink || serverRobotState == kUiSpeak) {
         pollWaitMs = kPollBusyMs;
       } else {
         pollWaitMs = kPollIdleMs;
@@ -1679,14 +908,14 @@ void setup() {
 
   Serial.println();
   Serial.println("=================================================");
-  Serial.println("Waveshare ESP32-S3 Integrated Audio Streamer");
-  Serial.printf("I2S0: MCLK=%d BCLK=%d LRCLK=%d MIC_DIN=%d SPK_DOUT=%d\n",
-                PIN_I2S_MCLK, PIN_I2S_BCLK, PIN_I2S_LRCLK, PIN_I2S_DIN, PIN_I2S_DOUT);
+  Serial.println("Waveshare ESP32-S3 Mic Streamer (TTS plays on the Mac)");
+  Serial.printf("I2S0 RX: MCLK=%d BCLK=%d LRCLK=%d MIC_DIN=%d\n",
+                PIN_I2S_MCLK, PIN_I2S_BCLK, PIN_I2S_LRCLK, PIN_I2S_DIN);
   Serial.printf("TFT: CS=%d SCK=%d MOSI=%d DC=%d RST=EXIO%d BL=%d (%dx%d landscape)\n",
                 PIN_TFT_CS, PIN_TFT_SCK, PIN_TFT_MOSI, PIN_TFT_DC,
                 EXIO_LCD_RST, PIN_TFT_BL, kTftWidth, kTftHeight);
   Serial.printf("Server Target: http://%s:%d%s\n", POST_SERVER_HOST, POST_SERVER_PORT, POST_SERVER_PATH);
-  Serial.printf("Speaker Pull:  http://%s:%d%s\n", POST_SERVER_HOST, POST_SERVER_PORT, SPEAKER_PULL_PATH);
+  Serial.printf("Robot State:   http://%s:%d%s\n", POST_SERVER_HOST, POST_SERVER_PORT, SPEAKER_PULL_PATH);
   Serial.println("=================================================");
 
   // 1. Bring up the TFT first so boot / WiFi status is visible.
@@ -1736,47 +965,18 @@ void setup() {
     drawEmotionFrame(ANIM_EMOTION_SAD, 0);
   }
 
-  // 3. One shared I2S0 bus, then both onboard audio codecs.
+  // 3. RX-only I2S0, then the ES7210 microphone ADC.
   if (!installI2sDriver()) {
-    Serial.println("[Audio] Shared I2S0 setup FAILED");
+    Serial.println("[Audio] I2S0 RX setup FAILED");
   } else {
-    Serial.println("[Audio] Shared I2S0 TX/RX ready");
-    speakerReady = setupAudioCodecs();
+    Serial.println("[Audio] I2S0 RX ready");
+    micReady = setupMicCodec();
   }
   Serial.printf("[Mic] ES7210 %s; PTT=LCD touch (hold the screen to capture)\n",
                 micReady ? "ready" : "FAILED");
 
-  // 4. ES8311 + onboard NS4150B amplifier. Failure is non-fatal for STT.
-  if (speakerReady) {
-    Serial.printf("[Speaker] ES8311 ready: volume=%d DOUT=%d PA=EXIO%d "
-                  "(K2=vol+, K3=vol-, 'p'=REDRED, 'b'=beep)\n",
-                  speakerVolume, PIN_I2S_DOUT, EXIO_PA_CTRL);
-  } else {
-    Serial.println("[Speaker] ES8311 setup FAILED (playback disabled)");
-  }
-
-  // 5. Create the mic-upload semaphore and 3-second speaker ring buffer.
+  // 4. Mic-upload semaphore.
   xSendSemaphore = xSemaphoreCreateBinary();
-  bool speakerRingInPsram = false;
-  speakerPcmStorage = static_cast<uint8_t*>(ps_malloc(kSpeakerRingBytes + 1));
-  if (speakerPcmStorage != nullptr) {
-    speakerRingInPsram = true;
-  } else {
-    // Keep playback available on boards where PSRAM failed to initialize.
-    speakerPcmStorage = static_cast<uint8_t*>(malloc(kSpeakerRingBytes + 1));
-  }
-  if (speakerPcmStorage != nullptr) {
-    speakerPcmStream = xStreamBufferCreateStatic(
-        kSpeakerRingBytes, 1, speakerPcmStorage, &speakerPcmStreamControl);
-  }
-  if (speakerPcmStream == nullptr) {
-    Serial.printf("[Speaker] Failed to allocate %u-byte ring buffer\n",
-                  static_cast<unsigned>(kSpeakerRingBytes));
-  } else {
-    Serial.printf("[Speaker] Ring buffer ready: %u bytes (3.0 s, %s)\n",
-                  static_cast<unsigned>(kSpeakerRingBytes),
-                  speakerRingInPsram ? "PSRAM" : "internal RAM");
-  }
 
   xTaskCreatePinnedToCore(
       displayTask,
@@ -1795,18 +995,6 @@ void setup() {
       4096,
       nullptr,
       5,
-      nullptr,
-      1
-  );
-
-  // Playback is independent from HTTP reception. Core 1 keeps I2S writes close
-  // to the audio capture task, while the network task fills the ring on Core 0.
-  xTaskCreatePinnedToCore(
-      speakerPlaybackTask,
-      "SpeakerPlayback",
-      4096,
-      nullptr,
-      4,
       nullptr,
       1
   );
@@ -1857,43 +1045,22 @@ void loop() {
   }
 
   // Ignore sub-100 ms contacts as barge-in so CST816D glitches do not stop TTS.
-  const bool speakingOrThinking =
-      speakerStreamOpen || speakerDownlinkPlaying ||
-      serverRobotState == kUiThink || serverRobotState == kUiSpeak;
-  if (pressed && lastPressed && speakingOrThinking && !bargeLatched &&
+  const bool robotBusy =
+      serverStateFresh(now) &&
+      (serverRobotState == kUiThink || serverRobotState == kUiSpeak);
+  if (pressed && lastPressed && robotBusy && !bargeLatched &&
       (now - pressStartMs) >= kBargeInMs) {
     bargeLatched = true;
-    speakerBargeIn = true;
-    Serial.printf("[Touch] Barge-in: stop speaker (playing=%d open=%d ui=%d)\n",
-                  speakerDownlinkPlaying ? 1 : 0,
-                  speakerStreamOpen ? 1 : 0,
-                  serverRobotState);
+    bargeInPending = true;
+    Serial.printf("[Touch] Barge-in: stop Mac reply (state=%s)\n",
+                  uiName(serverRobotState));
   }
-
-  static bool lastK2 = false;
-  static bool lastK3 = false;
-  static uint32_t lastVolumeKeyMs = 0;
-  const uint16_t exioBits = exio.readAll();
-  const bool k2Pressed = (exioBits & (1u << EXIO_KEY2)) == 0;
-  const bool k3Pressed = (exioBits & (1u << EXIO_KEY3)) == 0;
-  if (now - lastVolumeKeyMs > 30) {
-    if (k2Pressed && !lastK2) {
-      lastVolumeKeyMs = now;
-      applySpeakerVolume(speakerVolume + kSpeakerVolumeStep);
-    } else if (k3Pressed && !lastK3) {
-      lastVolumeKeyMs = now;
-      applySpeakerVolume(speakerVolume - kSpeakerVolumeStep);
-    }
-  }
-  lastK2 = k2Pressed;
-  lastK3 = k3Pressed;
 
   // Serial keyboard control:
   //   Ctrl+W (ASCII 0x17) -> toggle character/developer status screen,
-  //   'q' -> full emotion demo,
-  //   'p' -> REDRED beat (same key stops it), 'b' -> test beep (same key stops it).
-  while (pendingSerialChar >= 0 || Serial.available() > 0) {
-    int c = readSerialChar();
+  //   'q' -> full emotion demo.
+  while (Serial.available() > 0) {
+    int c = Serial.read();
     if (c == 0x17) {
       diagnosticDisplayMode = !diagnosticDisplayMode;
       animationMode = false;
@@ -1903,10 +1070,6 @@ void loop() {
       diagnosticDisplayMode = false;
       animationMode = true;
       Serial.println("[Display] Animation mode ON (q)");
-    } else if (c == 'p' || c == 'P') {
-      playRedRedBeat();
-    } else if (c == 'b' || c == 'B') {
-      playTestBeep();
     }
   }
 

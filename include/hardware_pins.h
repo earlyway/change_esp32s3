@@ -4,14 +4,14 @@
 // Pin map. Reference: docs/hardware_migration_esp32s3.md
 //
 // Everything on this board hangs off one shared I2C bus (GPIO10/11):
-//   ES8311  0x18  audio codec / DAC  (speaker)
+//   ES8311  0x18  audio codec / DAC  (speaker; unused, wiring broken)
 //   TCA9555 0x20  16-bit IO expander (LCD_RST, TP_RST, PA_CTRL, buttons ...)
 //   ES7210  0x40  4ch audio ADC      (dual mic array)
 //   PCF85063 0x51 RTC
 //   CST816D 0x15  touch controller   (on the LCD, only after TP_RST released)
 //
-// Audio uses ONE I2S bus shared by codec (TX) and ADC (RX):
-//   MCLK 12 / BCLK 13 / LRCLK 14 / DIN 15 (mic) / DOUT 16 (speaker)
+// Audio: I2S0 runs RX-only for the ES7210. TTS plays on the Mac speaker.
+//   MCLK 12 / BCLK 13 / LRCLK 14 / DIN 15 (mic) / DOUT 16 (speaker, unused)
 
 // ---------------------------------------------------------------- I2C
 #ifndef PIN_I2C_SDA
@@ -40,7 +40,7 @@
 #ifndef PIN_I2S_DIN            // ES7210 -> ESP32 (microphones)
 #define PIN_I2S_DIN 15
 #endif
-#ifndef PIN_I2S_DOUT           // ESP32 -> ES8311 (speaker)
+#ifndef PIN_I2S_DOUT           // ESP32 -> ES8311 (speaker); not wired up by the firmware
 #define PIN_I2S_DOUT 16
 #endif
 
@@ -81,10 +81,10 @@
 #define EXIO_CAM_PWDN  5
 #define EXIO_CAM_SEL   6
 #define EXIO_USB_MUX   7
-#define EXIO_PA_CTRL   8   // speaker amp enable, HIGH = on
+#define EXIO_PA_CTRL   8   // speaker amp enable, HIGH = on (kept LOW: speaker unused)
 #define EXIO_KEY1      9   // physical K1; unused by the app
-#define EXIO_KEY2      10  // volume up, active LOW
-#define EXIO_KEY3      11  // volume down, active LOW
+#define EXIO_KEY2      10  // physical K2, active LOW; unused (was volume up)
+#define EXIO_KEY3      11  // physical K3, active LOW; unused (was volume down)
 
 // ---------------------------------------------------------------- Misc GPIO
 #define PIN_BUTTON_BOOT 0   // active LOW, firmware recovery only
@@ -94,5 +94,5 @@
 #define PIN_SD_CMD      42
 #define PIN_BAT_ADC     8
 
-// Push-to-talk is the full LCD surface (CST816D). K1 is unused.
-// K2 raises speaker volume; K3 lowers it.
+// Push-to-talk is the full LCD surface (CST816D). K1/K2/K3 are unused;
+// TTS volume is the Mac's (see TTS_VOLUME in tools/stt_server.py).

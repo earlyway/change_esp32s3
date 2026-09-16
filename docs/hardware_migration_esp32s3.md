@@ -186,6 +186,30 @@
 - RGB LED 7개 (GPIO38)
 - 에코 캔슬링 (ES7210 듀얼 마이크)
 
+### 9단계. TTS 출력을 Mac 스피커로 이관 — 완료 (2026-09-16)
+보드 내장 스피커 배선이 단선되어 스피커 경로를 펌웨어에서 제거하고, 모든 TTS
+음성은 Mac 스피커에서 재생한다. ESP32는 수음(ES7210)과 표정 표시만 담당한다.
+
+- [x] 서버: `speaker_queue`(1초 청크 다운링크) 대신 `MacPlayer`가 TTS PCM을
+  WAV로 만들어 `afplay`로 재생. 새 답변이 시작되면 이전 재생을 중단.
+  `TTS_VOLUME`(0.0~1.0) 환경변수로 볼륨 조절
+- [x] 서버: `GET /speaker/pull`은 항상 204 + `X-Robot-State` / `X-Emotion` /
+  `X-Speak-Remaining-Ms` 헤더만 반환. `POST /speaker/flush`(barge-in)는 afplay 종료
+- [x] 서버: `afplay`가 오디오 종료 후 약 1초 프로세스를 유지하므로 재생 길이 + 0.5초가
+  지나면 종료로 간주해 표정이 늦게 풀리지 않게 함
+- [x] 펌웨어: ES8311 초기화, NS4150B 앰프 Enable, 재생 task, 3초 PSRAM 링 버퍼,
+  K2/K3 볼륨 키, 시리얼 `b`/`p` 테스트음 제거. `EXIO8 PA_CTRL`은 LOW 유지
+- [x] 펌웨어: I2S0을 `MASTER | RX` 전용으로 설치(`data_out_num = I2S_PIN_NO_CHANGE`).
+  ES7210 설정(TDM, 30 dB, MCLK 256fs)은 그대로
+- [x] 펌웨어: `/speaker/pull` 응답 헤더로 `idle / think / speak + 감정` 표정 동기화.
+  서버 상태가 5초 이상 갱신되지 않으면 idle로 복귀(Mac 다운·Wi-Fi 끊김 대비)
+- [x] 펌웨어: barge-in은 서버 상태가 think/speak일 때 100 ms 이상 터치 → `/speaker/flush`
+- [x] 빌드 성공 (RAM 43.8%, Flash 84.6%)
+- 진행 순서: 서버만 변경(프로토콜 유지) → 펌웨어 표정 동기화 → 펌웨어 스피커 코드 제거
+  → 문서 정리. 단계마다 빌드/서버 엔드포인트 검증 후 다음 단계로 이동
+- 참고: `lib/es8311/`은 남겨두었으나 더 이상 include하지 않으므로 빌드에 포함되지 않는다.
+  스피커 복구 시 `src/main.cpp.full`/git 이력의 7단계 코드를 참고
+
 ---
 
 ## 4. 새 핀맵 (`hardware_pins.h` 교체용)
@@ -197,13 +221,15 @@
 | I2C_SCL | 10 |
 
 ### I2S 오디오 (마이크·스피커 공용 버스, I2S_NUM_0 하나로 TX+RX)
+현재 펌웨어(9단계 이후)는 RX 전용으로만 사용한다. DOUT는 정의만 남아 있다.
+
 | 기능 | GPIO | 비고 |
 |---|---|---|
 | I2S_MCLK | 12 | 코덱 필수 |
 | I2S_BCLK | 13 | |
 | I2S_LRCLK | 14 | |
 | I2S_DIN (마이크, ES7210→ESP) | 15 | 15/16 헷갈리기 쉬움 — 커뮤니티에서 반대로 쓴 사례 다수 |
-| I2S_DOUT (스피커, ESP→ES8311) | 16 | |
+| I2S_DOUT (스피커, ESP→ES8311) | 16 | 9단계 이후 미사용 (스피커 단선) |
 
 ### LCD (18핀 FPC, ST7789T3)
 | 기능 | 핀 | 비고 |

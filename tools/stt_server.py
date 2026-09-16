@@ -216,10 +216,10 @@ class Hub:
         self.speaker_push_count = 0
         self.speaker_pull_count = 0
         self.last_robot: dict = {}
-        # Phase 5: thinking until LLM/TTS finishes enqueue (or fails).
+        # thinking until LLM/TTS hands the audio to the Mac player (or fails).
         self.robot_busy = False
         # Bumped by /speaker/flush (barge-in): an in-flight LLM/TTS reply whose
-        # generation no longer matches is dropped instead of being queued.
+        # generation no longer matches is dropped instead of being played.
         self.reply_generation = 0
         # PTT release handling: explicit end marker from the ESP32, plus a
         # fallback timer for when uploads simply stop arriving.
@@ -634,7 +634,7 @@ async def speaker_push(request: Request):
     if len(pcm) < 2:
         return PlainTextResponse("empty_pcm\n", status_code=400)
     try:
-        result = _enqueue_speaker_pcm(pcm, emotion)
+        result = _play_on_mac(pcm, emotion)
     except RuntimeError as exc:
         return PlainTextResponse(str(exc) + "\n", status_code=503)
     hub.speaker_push_count += 1
@@ -673,7 +673,7 @@ async def speaker_say(request: Request):
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
     try:
-        result = _enqueue_speaker_pcm(pcm, emotion)
+        result = _play_on_mac(pcm, emotion)
     except RuntimeError as exc:
         hub.robot_busy = False
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
@@ -703,7 +703,7 @@ async def _robot_auto_from_utterance(
     canned_reply: Optional[str] = None,
 ) -> None:
     # Stop any reply still playing so two turns never overlap on the speaker.
-    _flush_speaker_queue()
+    _stop_mac_speech()
     my_gen = hub.reply_generation
     try:
         async with hub.reply_lock:
@@ -737,7 +737,7 @@ async def _speak_robot_reply(text: str, emotion: str, gen: Optional[int] = None)
     if gen is not None and gen != hub.reply_generation:
         raise ReplyCancelled("barge-in during TTS")
     t_q0 = time.perf_counter()
-    result = _enqueue_speaker_pcm(pcm, emotion)
+    result = _play_on_mac(pcm, emotion)
     queue_s = time.perf_counter() - t_q0
     hub.speaker_push_count += 1
     stats = _pcm_stats(pcm)
@@ -752,7 +752,7 @@ async def _speak_robot_reply(text: str, emotion: str, gen: Optional[int] = None)
     )
     return {
         "bytes": len(pcm),
-        "queue_s": round(queue_s, 3),
+        "play_start_s": round(queue_s, 3),
         **result,
     }
 
@@ -794,7 +794,7 @@ async def _robot_respond(
             t_tts0 = time.perf_counter()
             spoken = await _speak_robot_reply(llm.reply, llm.emotion, gen=gen)
             t_tts = time.perf_counter() - t_tts0
-            t_queue = float(spoken.get("queue_s") or 0.0)
+            t_queue = float(spoken.get("play_start_s") or 0.0)
         except ReplyCancelled:
             print(f"[TTS] reply dropped (barge-in) source={source} reply={llm.reply!r}", flush=True)
             raise
@@ -810,7 +810,7 @@ async def _robot_respond(
         f"stt_end_to_llm={t_llm0 - t0:.2f}s "
         f"llm={llm.elapsed_s:.2f}s "
         f"tts={t_tts:.2f}s "
-        f"queue={t_queue:.2f}s "
+        f"play_start={t_queue:.2f}s "
         f"source={source}",
         flush=True,
     )
@@ -899,7 +899,7 @@ def _state_headers() -> dict[str, str]:
     return headers
 
 
-def _flush_speaker_queue() -> int:
+def _stop_mac_speech() -> int:
     stopped = 1 if hub.player.stop() else 0
     # Invalidate any LLM/TTS reply still being produced for the old turn.
     hub.reply_generation += 1
@@ -910,7 +910,7 @@ def _flush_speaker_queue() -> int:
 @app.post("/speaker/flush")
 async def speaker_flush():
     """ESP32 barge-in: stop Mac playback so a new PTT turn can start."""
-    dropped = _flush_speaker_queue()
+    dropped = _stop_mac_speech()
     print(f"[SPEAKER] flush stopped={dropped}", flush=True)
     return JSONResponse({"ok": True, "dropped": dropped})
 
@@ -972,7 +972,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
         hub.clients.discard(ws)
 
 
-def _enqueue_speaker_pcm(pcm: bytes, emotion: str) -> dict:
+def _play_on_mac(pcm: bytes, emotion: str) -> dict:
     """Play one utterance on the Mac speaker (stops whatever was playing)."""
     return hub.player.play(pcm, emotion)
 

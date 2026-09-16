@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Ask the running STT server to speak a sentence on the ESP32.
+"""Ask the running STT server to speak a sentence on the Mac speaker.
 
 Usage:
     python3 tools/speak.py 안녕하세요
     python3 tools/speak.py --emotion positive "오늘 날씨 정말 좋다"
 
-The server (tools/stt_server.py) must already be running. ESP32 firmware
-must be the Phase 1 build that polls GET /speaker/pull.
+The server (tools/stt_server.py) must already be running. The ESP32 only
+mirrors the state/emotion on its face via GET /speaker/pull.
 """
 
 from __future__ import annotations

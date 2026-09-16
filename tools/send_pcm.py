@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Push 16 kHz / 16-bit / mono PCM to the STT server for ESP32 speaker playback.
+"""Push 16 kHz / 16-bit / mono PCM to the STT server to play on the Mac speaker.
 
 Usage:
     python3 tools/send_pcm.py                  # 1 s 440 Hz tone
     python3 tools/send_pcm.py path/to/file.wav # WAV or raw PCM
     python3 tools/send_pcm.py --emotion positive file.wav
 
-The server must already be running (python3 tools/stt_server.py).
-ESP32 polls GET /speaker/pull and plays each queued chunk.
+The server must already be running (python3 tools/stt_server.py). Useful to
+check Mac playback and the ESP32 face sync (X-Robot-State / X-Emotion).
 """
 
 from __future__ import annotations

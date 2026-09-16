@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""macOS TTS → 16 kHz / 16-bit / mono PCM (ESP32 speaker format).
+"""macOS TTS → 16 kHz / 16-bit / mono PCM (robot pipeline format).
 
 Uses the built-in `say` command and `afconvert`. No extra pip packages.
 Override the voice with TTS_VOICE (default: first ko_KR voice, usually Yuna).

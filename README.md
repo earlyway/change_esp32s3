@@ -1,14 +1,18 @@
 # change_esp32s3
 
-Voice assistant firmware (push-to-talk mic → STT → LLM → TTS playback, with an
+Voice assistant firmware (push-to-talk mic → STT → LLM → TTS, with an
 animated LCD face) migrated from a classic ESP32 DevKit to the
 **Waveshare ESP32-S3-AUDIO-Board**.
 
 This repository continues the work from `speaker_connect_tts`, but on completely
-new hardware. The microphone, speaker, display and button interfaces have been
-rewritten and verified on the new board. TTS audio is received into a
-PSRAM-backed three-second ring buffer and played by a separate task to avoid
-gaps at one-second HTTP chunk boundaries.
+new hardware. The microphone, display and touch interfaces have been rewritten
+and verified on the new board.
+
+**Audio roles:** the ESP32-S3 captures the microphones and shows the face; all
+TTS replies play on the **Mac speaker** (`afplay`). The board's built-in speaker
+wiring is broken, so the ES8311/NS4150B playback path was removed from the
+firmware. The board still polls `GET /speaker/pull`, but only to mirror the
+robot state (idle / thinking / speaking + emotion) on the LCD.
 
 ## Hardware
 
@@ -18,17 +22,17 @@ gaps at one-second HTTP chunk boundaries.
 | Display | [Waveshare 2inch Capacitive Touch LCD](https://www.waveshare.com/wiki/2inch_Capacitive_Touch_LCD) | ST7789T3, 240×320, CST816D touch, connected via the board's 18-pin FPC display connector |
 | Host connection | USB-C (native USB CDC, no UART bridge) | |
 
-The speaker is factory-mounted inside the board housing; nothing external is wired.
+The built-in speaker is not used (its wiring is broken); TTS plays on the Mac.
 
 ### Pin map (summary)
 
 | Bus | Pins |
 |---|---|
-| I2C (shared) | SDA 11, SCL 10 — ES8311 0x18, TCA9555 0x20, ES7210 0x40, PCF85063 0x51, CST816D 0x15 |
-| I2S (shared TX+RX) | MCLK 12, BCLK 13, LRCLK 14, DIN 15 (mic), DOUT 16 (speaker) |
+| I2C (shared) | SDA 11, SCL 10 — ES8311 0x18 (unused), TCA9555 0x20, ES7210 0x40, PCF85063 0x51, CST816D 0x15 |
+| I2S (RX only) | MCLK 12, BCLK 13, LRCLK 14, DIN 15 (mic); DOUT 16 (speaker) unused |
 | LCD SPI | CS 3, SCK 4, MOSI 9, MISO 8, DC 7, BL 5, RST → TCA9555 EXIO0 |
-| TCA9555 | EXIO0 LCD_RST, EXIO1 TP_RST, EXIO2 TP_INT, EXIO8 PA_CTRL (amp enable), EXIO9 K1 unused, EXIO10–11 K2/K3 volume |
-| Buttons | PTT = full-screen LCD touch; K2 = volume up, K3 = volume down; BOOT = GPIO0 (firmware recovery) |
+| TCA9555 | EXIO0 LCD_RST, EXIO1 TP_RST, EXIO2 TP_INT, EXIO8 PA_CTRL (kept LOW), EXIO9–11 K1/K2/K3 unused |
+| Buttons | PTT = full-screen LCD touch; BOOT = GPIO0 (firmware recovery). Mac volume controls TTS loudness (`TTS_VOLUME`) |
 
 Full details, board layout photo and the step-by-step bring-up checklist are in
 [`docs/hardware_migration_esp32s3.md`](docs/hardware_migration_esp32s3.md) (Korean).
@@ -43,7 +47,7 @@ include/cst816d.h          minimal CST816D touch driver
 include/*.example.h        templates for WiFi / server secrets
 src/main.cpp               integrated Waveshare application (stage 7)
 src/main.cpp.full          untouched legacy application reference
-tools/                     FastAPI STT, Ollama LLM, macOS TTS and web UI
+tools/                     FastAPI STT, Ollama LLM, TTS + Mac speaker playback, web UI
 Start Robot.command        macOS double-click launcher
 Stop Robot.command         stops this project's local voice server
 docs/                      migration guide and images
@@ -153,11 +157,12 @@ button below RESET) while plugging in USB, then release.
 | 1 | Boot, USB serial, flash/PSRAM verification | done |
 | 2 | I2C bus + TCA9555; all 5 I2C devices detected, FPC link verified | done |
 | 3 | LCD bring-up (ST7789, backlight, 240×320) | done |
-| 4 | Speaker output via ES8311 codec + PA enable | done |
+| 4 | Speaker output via ES8311 codec + PA enable | retired (see 9) |
 | 5 | Microphone input via ES7210 ADC (live stereo level meter) | done |
 | 6 | Push-to-talk using built-in K1 (TCA9555 EXIO9) | superseded |
 | 7 | Full app: K1 → STT → Ollama → TTS → emotion face | done |
 | 8 | Full-screen LCD touch PTT (CST816D); RGB LED ring, echo cancellation | PTT done |
+| 9 | TTS playback moved to the Mac speaker (`afplay`); ESP32 is mic + face only | done |
 
 ## Toolchain notes
 

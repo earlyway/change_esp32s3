@@ -167,7 +167,7 @@
     <p class="hint">
       확정 텍스트(흰색)는 클릭 후 키보드로 직접 수정할 수 있습니다. 편집 중에는 서버 확정문만 덮어쓰지 않고, 회색 partial은 계속 갱신됩니다.
       <br />ESP32가 <code>/upload</code> 로 1초 단위 PCM 청크를 내면 자동으로 인식됩니다.
-      <br /><strong>말하기</strong>는 맥의 <code>say</code>로 음성을 만든 뒤 ESP32가 <code>/speaker/pull</code>로 받아 재생합니다.
+      <br /><strong>말하기</strong>는 TTS(Supertonic, 실패 시 <code>say</code>)로 음성을 만들어 <strong>맥 스피커</strong>에서 재생합니다. ESP32는 <code>/speaker/pull</code>로 상태·감정만 받아 표정을 맞춥니다.
       <br /><strong>물어보기</strong>는 기본 Ollama qwen2.5:14b, 전환은 <code>LLM_BACKEND=openai</code> + <code>OPENAI_API_KEY</code>. 발화 종료 시 자동 답변(<code>ROBOT_AUTO_REPLY=1</code>).
     </p>
   </div>
