@@ -1105,6 +1105,18 @@ bool pollSpeakerPull(const String& pullUrl) {
   int httpCode = http.GET();
   if (httpCode == 204 || httpCode == HTTP_CODE_NO_CONTENT) {
     applyServerRobotState(http.header("X-Robot-State"));
+    // TTS now plays on the Mac speaker: no PCM comes back, so the face must
+    // follow the server state instead of local playback.
+    if (!speakerStreamOpen && !speakerDownlinkPlaying) {
+      if (serverRobotState == kUiSpeak) {
+        String emotion = http.header("X-Emotion");
+        faceEmotionIndex = emotionIndexFromTag(emotion.c_str());
+        // Hold past the next busy poll so the face does not flicker between polls.
+        faceHoldUntilMs = millis() + 1500;
+      } else if (faceHoldActive(millis())) {
+        faceHoldUntilMs = millis();
+      }
+    }
     http.end();
     netActivity = kNetIdle;
     return false;

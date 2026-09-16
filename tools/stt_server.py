@@ -7,14 +7,14 @@ Pipeline:
             live preview + fallback --> WebSocket /ws
         --> local web page text input (tools/web/index.html)
 
-    Mac --POST /speaker/say (text)--> selectable TTS --> /speaker/push queue
-        --GET /speaker/pull--> ESP32 I2S speaker
+    Mac --POST /speaker/say (text)--> selectable TTS --> Mac speaker (afplay)
+        ESP32 --GET /speaker/pull--> X-Robot-State / X-Emotion only (face sync)
 
     STT utterance end (or POST /robot/reply) --> LLM (Ollama qwen2.5:14b
-        or OpenAI gpt-4o-mini) --> TTS --> speaker queue
+        or OpenAI gpt-4o-mini) --> TTS --> Mac speaker
 
-Replaces tools/ping_server.js on the same port (3000). The ESP32 firmware still
-POSTs raw PCM to /upload. Speaker downlink uses /speaker/push and /speaker/pull.
+The board's speaker wiring is gone, so all TTS audio plays on the Mac. The
+ESP32 keeps polling /speaker/pull, but only to mirror robot state on the LCD.
 
 Run:
     pip install -r tools/requirements.txt
@@ -33,7 +33,8 @@ Environment variables:
     SAVE_RAW      "1" to also save received chunks to tools/uploads/*.raw
     SILENCE_RMS_DBFS  skip chunks quieter than this RMS dBFS (default -46)
     END_SILENCE_S unused leftover (PTT ends via /utterance/end, not silence)
-    SKIP_STT      "1" to skip loading faster-whisper (speaker downlink still works)
+    SKIP_STT      "1" to skip loading faster-whisper (speaker endpoints still work)
+    TTS_VOLUME    Mac playback gain for afplay, 0.0-1.0 (default 1.0)
     TTS_BACKEND   supertonic (default) or macos
     SUPERTONIC_URL local sidecar URL (default http://127.0.0.1:3001)
     TTS_VOICE     fallback macOS `say` voice (default: first ko_KR voice)
@@ -50,10 +51,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
+import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
 import warnings
+import wave
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -97,10 +102,95 @@ UPLOAD_IDLE_END_S = float(os.environ.get("UPLOAD_IDLE_END_S", "3.0"))
 AUDIO_CHUNK_S = 1.0
 SKIP_STT = os.environ.get("SKIP_STT", "0") == "1"
 ROBOT_AUTO_REPLY = os.environ.get("ROBOT_AUTO_REPLY", "1") == "1"
-SPEAKER_CHUNK_BYTES = 32000  # 1 s of 16 kHz / 16-bit / mono PCM
-SPEAKER_QUEUE_MAX = 64       # ~64 s of pending playback
+SPEAKER_BYTES_PER_SECOND = 32000  # 16 kHz / 16-bit / mono PCM
+# TTS plays on the Mac speaker (the board's speaker wiring is gone). 0.0–1.0
+# maps to `afplay -v`; values above 1.0 amplify.
+TTS_VOLUME = float(os.environ.get("TTS_VOLUME", "1.0"))
 # PTT release with no usable transcript still gets a short spoken retry prompt.
 EMPTY_UTTERANCE_REPLY = "잘 못 들었어. 다시 말해 줄래?"
+
+
+class MacPlayer:
+    """Plays 16 kHz mono PCM through the Mac speaker with `afplay`.
+
+    One utterance at a time: starting a new one stops the previous. The ESP32
+    still polls /speaker/pull, but only for X-Robot-State / X-Emotion so the
+    face can follow the reply; no audio goes back to the board.
+    """
+
+    def __init__(self) -> None:
+        self.proc: Optional[subprocess.Popen] = None
+        self.path: Optional[str] = None
+        self.emotion = "none"
+        self.started_mono = 0.0
+        self.duration_s = 0.0
+        self.play_count = 0
+        self.afplay = shutil.which("afplay")
+
+    # afplay lingers ~1 s after the last sample (CoreAudio teardown). Treat the
+    # utterance as done once the audio itself must have ended so the face
+    # returns to idle on time.
+    END_GRACE_S = 0.5
+
+    def playing(self) -> bool:
+        if self.proc is None:
+            return False
+        if self.proc.poll() is not None:
+            self._cleanup()
+            return False
+        if time.monotonic() - self.started_mono > self.duration_s + self.END_GRACE_S:
+            self.stop()
+            return False
+        return True
+
+    def remaining_ms(self) -> int:
+        if not self.playing():
+            return 0
+        left = self.duration_s - (time.monotonic() - self.started_mono)
+        return max(0, int(left * 1000))
+
+    def play(self, pcm: bytes, emotion: str) -> dict:
+        if self.afplay is None:
+            raise RuntimeError("afplay_not_found (macOS required for Mac speaker output)")
+        self.stop()
+        fd, path = tempfile.mkstemp(prefix="mallow_tts_", suffix=".wav")
+        os.close(fd)
+        with wave.open(path, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes(pcm)
+        self.proc = subprocess.Popen(
+            [self.afplay, "-v", f"{TTS_VOLUME:.2f}", path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.path = path
+        self.emotion = emotion
+        self.started_mono = time.monotonic()
+        self.duration_s = len(pcm) / SPEAKER_BYTES_PER_SECOND
+        self.play_count += 1
+        return {"seconds": round(self.duration_s, 2), "emotion": emotion}
+
+    def stop(self) -> bool:
+        was_playing = self.proc is not None and self.proc.poll() is None
+        if was_playing:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self._cleanup()
+        return was_playing
+
+    def _cleanup(self) -> None:
+        self.proc = None
+        if self.path:
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
+        self.path = None
 
 # `app` is created after the lifespan handlers below (see _lifespan).
 
@@ -121,8 +211,8 @@ class Hub:
         self.in_utterance = False
         # Bumped on utterance end / full reset; stale in-flight STT results are dropped.
         self.utterance_generation = 0
-        # Phase 1 downlink: (pcm_bytes, emotion) chunks for ESP32 GET /speaker/pull.
-        self.speaker_queue: Optional["asyncio.Queue[tuple[bytes, str]]"] = None
+        # TTS output: Mac speaker. GET /speaker/pull only reports state now.
+        self.player = MacPlayer()
         self.speaker_push_count = 0
         self.speaker_pull_count = 0
         self.last_robot: dict = {}
@@ -171,7 +261,8 @@ async def on_startup() -> None:
 
     # Create asyncio objects after uvicorn has created the running loop.
     hub.queue = asyncio.Queue()
-    hub.speaker_queue = asyncio.Queue(maxsize=SPEAKER_QUEUE_MAX)
+    if hub.player.afplay is None:
+        print("[Speaker] WARNING: afplay not found; TTS playback disabled", flush=True)
 
     if SKIP_STT:
         print("[STT] SKIP_STT=1: not loading faster-whisper. /upload will 503; /speaker/* works.")
@@ -197,7 +288,8 @@ async def on_startup() -> None:
         hub.worker_task.add_done_callback(_worker_done)
         hub.idle_task = asyncio.create_task(_upload_idle_watch())
     print(f"[STT] Listening on http://0.0.0.0:{PORT}  (open http://localhost:{PORT})")
-    print("[Speaker] Downlink ready: POST /speaker/push  POST /speaker/say  POST /speaker/flush  GET /speaker/pull")
+    print(f"[Speaker] Mac speaker output (afplay, volume={TTS_VOLUME:.2f}): "
+          "POST /speaker/say  POST /speaker/push  POST /speaker/flush  GET /speaker/pull (state only)")
     print(f"[STT] PTT end marker: POST /utterance/end  (fallback: no uploads for {UPLOAD_IDLE_END_S:.0f}s)")
     print(f"[LLM] backend={backend_name()} model={model_name()} auto_reply={int(ROBOT_AUTO_REPLY)}")
     try:
@@ -211,6 +303,7 @@ async def on_shutdown() -> None:
         hub.worker_task.cancel()
     if hub.idle_task:
         hub.idle_task.cancel()
+    hub.player.stop()
 
 
 @asynccontextmanager
@@ -534,7 +627,7 @@ async def ping(request: Request) -> PlainTextResponse:
 
 @app.post("/speaker/push")
 async def speaker_push(request: Request):
-    """Queue 16 kHz / 16-bit / mono PCM (or a WAV wrapping that format) for the ESP32."""
+    """Play 16 kHz / 16-bit / mono PCM (or a WAV wrapping that format) on the Mac speaker."""
     body = await request.body()
     emotion = (request.headers.get("x-emotion") or "none").strip() or "none"
     pcm = _pcm_from_body(body)
@@ -550,19 +643,17 @@ async def speaker_push(request: Request):
         "[SPEAKER] push "
         f"#{hub.speaker_push_count} "
         f"bytes={len(pcm)} "
-        f"chunks={result['chunks']} "
-        f"dropped_old={result['dropped_old']} "
+        f"seconds={result['seconds']} "
         f"emotion={emotion!r} "
-        f"rms={stats['rms_dbfs']:.1f}dBFS "
-        f"queue={result['queue']}",
+        f"rms={stats['rms_dbfs']:.1f}dBFS",
         flush=True,
     )
-    return JSONResponse({"ok": True, "bytes": len(pcm), **result, "emotion": emotion})
+    return JSONResponse({"ok": True, "bytes": len(pcm), **result})
 
 
 @app.post("/speaker/say")
 async def speaker_say(request: Request):
-    """Synthesize a sentence with the selected TTS backend and queue it."""
+    """Synthesize a sentence with the selected TTS backend and play it on the Mac."""
     try:
         payload = await request.json()
     except Exception:
@@ -594,22 +685,12 @@ async def speaker_say(request: Request):
         "[TTS] manual "
         f"text={text!r} "
         f"bytes={len(pcm)} "
-        f"chunks={result['chunks']} "
+        f"seconds={result['seconds']} "
         f"emotion={emotion!r} "
-        f"rms={stats['rms_dbfs']:.1f}dBFS "
-        f"queue={result['queue']}",
+        f"rms={stats['rms_dbfs']:.1f}dBFS",
         flush=True,
     )
-    return JSONResponse(
-        {
-            "ok": True,
-            "text": text,
-            "bytes": len(pcm),
-            "seconds": round(len(pcm) / 32000, 2),
-            **result,
-            "emotion": emotion,
-        }
-    )
+    return JSONResponse({"ok": True, "text": text, "bytes": len(pcm), **result})
 
 
 class ReplyCancelled(Exception):
@@ -621,7 +702,7 @@ async def _robot_auto_from_utterance(
     t_stt_end: float,
     canned_reply: Optional[str] = None,
 ) -> None:
-    # Drop any unplayed previous reply so two turns cannot share the speaker queue.
+    # Stop any reply still playing so two turns never overlap on the speaker.
     _flush_speaker_queue()
     my_gen = hub.reply_generation
     try:
@@ -664,18 +745,15 @@ async def _speak_robot_reply(text: str, emotion: str, gen: Optional[int] = None)
         "[TTS] robot "
         f"text={text!r} "
         f"bytes={len(pcm)} "
-        f"chunks={result['chunks']} "
+        f"seconds={result['seconds']} "
         f"emotion={emotion!r} "
-        f"rms={stats['rms_dbfs']:.1f}dBFS "
-        f"queue={result['queue']}",
+        f"rms={stats['rms_dbfs']:.1f}dBFS",
         flush=True,
     )
     return {
         "bytes": len(pcm),
-        "seconds": round(len(pcm) / 32000, 2),
         "queue_s": round(queue_s, 3),
         **result,
-        "emotion": emotion,
     }
 
 
@@ -803,78 +881,59 @@ async def robot_status():
 
 
 def _robot_state() -> str:
-    q = hub.speaker_queue.qsize() if hub.speaker_queue is not None else 0
-    if q > 0:
+    # "speaking" lasts until afplay actually finishes, so the face on the
+    # board stays in sync with the Mac speaker.
+    if hub.player.playing():
         return "speaking"
     if hub.robot_busy:
         return "thinking"
     return "idle"
 
 
+def _state_headers() -> dict[str, str]:
+    state = _robot_state()
+    headers = {"X-Robot-State": state}
+    if state == "speaking":
+        headers["X-Emotion"] = hub.player.emotion
+        headers["X-Speak-Remaining-Ms"] = str(hub.player.remaining_ms())
+    return headers
+
+
 def _flush_speaker_queue() -> int:
-    dropped = 0
-    if hub.speaker_queue is None:
-        return 0
-    while True:
-        try:
-            hub.speaker_queue.get_nowait()
-            dropped += 1
-        except asyncio.QueueEmpty:
-            break
+    stopped = 1 if hub.player.stop() else 0
     # Invalidate any LLM/TTS reply still being produced for the old turn.
     hub.reply_generation += 1
     hub.robot_busy = False
-    return dropped
+    return stopped
 
 
 @app.post("/speaker/flush")
 async def speaker_flush():
-    """ESP32 barge-in: drop queued PCM so a new PTT turn can start."""
+    """ESP32 barge-in: stop Mac playback so a new PTT turn can start."""
     dropped = _flush_speaker_queue()
-    print(f"[SPEAKER] flush dropped={dropped}", flush=True)
+    print(f"[SPEAKER] flush stopped={dropped}", flush=True)
     return JSONResponse({"ok": True, "dropped": dropped})
 
 
 @app.get("/speaker/pull")
 async def speaker_pull():
-    """ESP32 polls this. 204 = nothing to play; 200 = one PCM chunk."""
-    if hub.speaker_queue is None:
-        return Response(status_code=503, headers={"X-Robot-State": _robot_state()})
-    try:
-        chunk, emotion = hub.speaker_queue.get_nowait()
-    except asyncio.QueueEmpty:
-        return Response(status_code=204, headers={"X-Robot-State": _robot_state()})
-
+    """ESP32 polls this for robot state. Audio plays on the Mac, so always 204."""
     hub.speaker_pull_count += 1
-    print(
-        "[SPEAKER] pull "
-        f"#{hub.speaker_pull_count} "
-        f"bytes={len(chunk)} "
-        f"emotion={emotion!r} "
-        f"queue={hub.speaker_queue.qsize()}",
-        flush=True,
-    )
-    return Response(
-        content=chunk,
-        media_type="application/octet-stream",
-        headers={
-            "X-Emotion": emotion,
-            "X-Sample-Rate": "16000",
-            "X-Channels": "1",
-            "X-Bits": "16",
-            "X-Robot-State": _robot_state(),
-        },
-    )
+    return Response(status_code=204, headers=_state_headers())
 
 
 @app.get("/speaker/status")
 async def speaker_status():
-    q = hub.speaker_queue.qsize() if hub.speaker_queue is not None else 0
     return JSONResponse(
         {
-            "queue": q,
+            "state": _robot_state(),
+            "playing": hub.player.playing(),
+            "emotion": hub.player.emotion,
+            "remaining_ms": hub.player.remaining_ms(),
+            "play_count": hub.player.play_count,
             "push_count": hub.speaker_push_count,
             "pull_count": hub.speaker_pull_count,
+            "volume": TTS_VOLUME,
         }
     )
 
@@ -914,29 +973,8 @@ async def ws_endpoint(ws: WebSocket) -> None:
 
 
 def _enqueue_speaker_pcm(pcm: bytes, emotion: str) -> dict:
-    if hub.speaker_queue is None:
-        raise RuntimeError("speaker_queue_not_ready")
-    chunks = _split_speaker_chunks(pcm)
-    queued = 0
-    dropped = 0
-    truncated = 0
-    for chunk in chunks:
-        if hub.speaker_queue.full():
-            truncated = len(chunks) - queued
-            print(
-                f"[SPEAKER] queue full; keeping already-queued start, "
-                f"dropping {truncated} later chunk(s)",
-                flush=True,
-            )
-            break
-        hub.speaker_queue.put_nowait((chunk, emotion))
-        queued += 1
-    return {
-        "chunks": queued,
-        "dropped_old": dropped,
-        "truncated": truncated,
-        "queue": hub.speaker_queue.qsize(),
-    }
+    """Play one utterance on the Mac speaker (stops whatever was playing)."""
+    return hub.player.play(pcm, emotion)
 
 
 def _save_raw(body: bytes) -> None:
@@ -971,10 +1009,6 @@ def _pcm_from_wav(body: bytes) -> bytes:
     if len(data) % 2 == 1:
         data = data[:-1]
     return data
-
-
-def _split_speaker_chunks(pcm: bytes) -> list[bytes]:
-    return [pcm[i:i + SPEAKER_CHUNK_BYTES] for i in range(0, len(pcm), SPEAKER_CHUNK_BYTES)]
 
 
 def _pcm_stats(body: bytes) -> dict[str, float]:
